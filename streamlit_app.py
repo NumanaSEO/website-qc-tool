@@ -1,5 +1,4 @@
 import streamlit as st
-import streamlit.components.v1 as components
 import pandas as pd
 import requests
 import re
@@ -99,8 +98,6 @@ def get_doc_comments(creds, doc_url, ignored_authors=[]):
         if not match: return "Error: Invalid URL"
         doc_id = match.group(1)
         service = build('drive', 'v3', credentials=creds)
-        
-        # Request author field
         results = service.comments().list(
             fileId=doc_id, 
             fields="comments(content, quotedFileContent, author(displayName))"
@@ -109,10 +106,8 @@ def get_doc_comments(creds, doc_url, ignored_authors=[]):
         links = []
         for c in results.get('comments', []):
             if 'quotedFileContent' in c:
-                # Check Author
                 author_name = c.get('author', {}).get('displayName', '')
-                if author_name in ignored_authors:
-                    continue
+                if author_name in ignored_authors: continue
                 
                 links.append({
                     'anchor': c['quotedFileContent']['value'].strip(), 
@@ -124,6 +119,8 @@ def get_doc_comments(creds, doc_url, ignored_authors=[]):
 
 def check_oxygen_link(html_content, anchor_text):
     soup = BeautifulSoup(html_content, 'html.parser')
+    
+    # Use developer class if available
     content_area = soup.find(class_="page-content-area")
     search_scope = content_area if content_area else soup
 
@@ -131,14 +128,32 @@ def check_oxygen_link(html_content, anchor_text):
         for rubbish in soup.select('.ct-header, .ct-footer, header, footer, .oxy-nav-menu'): 
             rubbish.decompose()
 
-    pattern = re.compile(re.escape(anchor_text), re.IGNORECASE)
-    target = search_scope.find(string=pattern)
+    # --- IMPROVED SEARCH LOGIC ---
+    # 1. Try Exact Match first
+    # 2. Try Fuzzy Match (removing extra spaces/newlines from HTML) to find phone numbers/messy text
     
-    if target:
-        if target.parent.name == 'a' and target.parent.has_attr('href'):
-            return target.parent['href'], "Found (Direct)"
+    # Normalize input
+    clean_anchor = " ".join(anchor_text.split()).lower()
+    
+    # Find all text nodes
+    all_text_nodes = search_scope.find_all(string=True)
+    
+    target_node = None
+    
+    # Scan nodes
+    for node in all_text_nodes:
+        clean_node = " ".join(node.split()).lower()
+        if clean_anchor in clean_node:
+            target_node = node
+            break
+    
+    if target_node:
+        # 1. Check Direct Parent
+        if target_node.parent.name == 'a' and target_node.parent.has_attr('href'):
+            return target_node.parent['href'], "Found (Direct)"
             
-        curr = target.parent
+        # 2. Check Up to 12 Parents (Oxygen Wrappers)
+        curr = target_node.parent
         steps = 0
         while curr and steps < 12:
             if curr.name == 'a' and curr.has_attr('href'):
@@ -153,8 +168,10 @@ def check_oxygen_link(html_content, anchor_text):
 def verify_with_gemini(anchor, instruction, link, creds):
     if not link: return "FAIL", "Link missing"
     try:
+        # FIX: Use generic model alias to avoid 404 errors
         vertexai.init(project=creds.project_id, location="us-central1", credentials=creds)
-        model = GenerativeModel("gemini-1.5-flash-001")
+        model = GenerativeModel("gemini-1.5-flash") # Removed -001
+        
         prompt = f"""
         You are a QA Bot.
         Text: "{anchor}"
