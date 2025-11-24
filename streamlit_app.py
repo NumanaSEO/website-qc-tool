@@ -70,18 +70,34 @@ def get_doc_text(creds, doc_url):
         return f"Error: {e}"
 
 def get_web_text_clean(url):
+    """
+    Extracts text ONLY from 'page-content-area' if it exists.
+    """
     try:
         headers = {'User-Agent': 'Mozilla/5.0 (QC-Bot)'}
         resp = requests.get(url, headers=headers, timeout=20)
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, 'html.parser')
-        for tag in soup(["script", "style", "noscript", "iframe", "svg"]): tag.decompose()
         
-        oxy_junk = ["header", "footer", ".ct-header", ".ct-footer", ".oxy-header-container", ".oxy-nav-menu", ".ct-mobile-menu-icon", "#masthead", ".site-footer", ".screen-reader-text", ".visually-hidden", "#cookie-law-info-bar", ".moove-gdpr-cookie-compliance"]
-        for selector in oxy_junk:
-            for tag in soup.select(selector): tag.decompose()
-            
-        text = soup.get_text(separator='\n')
+        # Always remove scripts/styles regardless of container
+        for tag in soup(["script", "style", "noscript", "iframe", "svg"]): 
+            tag.decompose()
+        
+        # --- NEW LOGIC START ---
+        # 1. Look for the Developer's Class
+        content_area = soup.find(class_="page-content-area")
+        
+        if content_area:
+            # Great! Only use text inside this div
+            text = content_area.get_text(separator='\n')
+        else:
+            # Fallback: Clean up standard junk if class is missing
+            oxy_junk = ["header", "footer", ".ct-header", ".ct-footer", ".oxy-header-container", ".oxy-nav-menu", ".ct-mobile-menu-icon", "#masthead", ".site-footer", ".screen-reader-text", ".visually-hidden", "#cookie-law-info-bar", ".moove-gdpr-cookie-compliance"]
+            for selector in oxy_junk:
+                for tag in soup.select(selector): tag.decompose()
+            text = soup.get_text(separator='\n')
+        # --- NEW LOGIC END ---
+
         return text.strip()
     except Exception as e:
         return f"Error: {e}"
@@ -104,18 +120,28 @@ def get_doc_comments(creds, doc_url):
 
 def check_oxygen_link(html_content, anchor_text):
     soup = BeautifulSoup(html_content, 'html.parser')
-    for rubbish in soup.select('.ct-header, .ct-footer, header, footer, .oxy-nav-menu'): rubbish.decompose()
+    
+    # --- NEW LOGIC START ---
+    # Define Search Scope: Use 'page-content-area' if available
+    content_area = soup.find(class_="page-content-area")
+    search_scope = content_area if content_area else soup
 
-    # Smart Search: Find the text, then look Up (Parents) and Down (Children)
+    if not content_area:
+        # Only decompose headers if we are searching the whole page
+        for rubbish in soup.select('.ct-header, .ct-footer, header, footer, .oxy-nav-menu'): 
+            rubbish.decompose()
+    # --- NEW LOGIC END ---
+
+    # Smart Search: Find the text, then look Up (Parents)
     pattern = re.compile(re.escape(anchor_text), re.IGNORECASE)
-    target = soup.find(string=pattern)
+    target = search_scope.find(string=pattern)
     
     if target:
         # 1. Check if the element itself is an <a> tag
         if target.parent.name == 'a' and target.parent.has_attr('href'):
             return target.parent['href'], "Found (Direct)"
             
-        # 2. Walk UP (Oxygen Link Wrappers) - Increased depth to 12
+        # 2. Walk UP (Oxygen Link Wrappers) - Depth 12
         curr = target.parent
         steps = 0
         while curr and steps < 12:
@@ -131,10 +157,10 @@ def check_oxygen_link(html_content, anchor_text):
 def verify_with_gemini(anchor, instruction, link, creds):
     if not link: return "FAIL", "Link missing"
     try:
-        # FIX: Explicitly set location to 'us-central1' to avoid 404 errors
+        # Explicitly set location to 'us-central1'
         vertexai.init(project=creds.project_id, location="us-central1", credentials=creds)
         
-        # FIX: Use specific model version
+        # Use specific model version
         model = GenerativeModel("gemini-1.5-flash-001")
         
         prompt = f"""
