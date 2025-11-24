@@ -94,9 +94,6 @@ def get_web_text_clean(url):
 
 # --- LINK EXTRACTORS ---
 def get_doc_comments(creds, doc_url, ignored_authors=[]):
-    """
-    Fetches comments, optionally filtering out specific author names.
-    """
     try:
         match = re.search(r'/d/([a-zA-Z0-9-_]+)', doc_url)
         if not match: return "Error: Invalid URL"
@@ -111,7 +108,6 @@ def get_doc_comments(creds, doc_url, ignored_authors=[]):
         
         links = []
         for c in results.get('comments', []):
-            # Check if comments has highlighting
             if 'quotedFileContent' in c:
                 # Check Author
                 author_name = c.get('author', {}).get('displayName', '')
@@ -202,7 +198,6 @@ with st.sidebar:
         staging_domain = st.text_input("New Domain", placeholder="e.g. wordpress-123.cloudwaysapps.com")
 
     st.divider()
-    # --- NEW FEATURE: IGNORE AUTHORS ---
     st.caption("Filters")
     ignored_input = st.text_input("Ignore Comments By:", placeholder="Name 1, Name 2")
     ignored_authors = [x.strip() for x in ignored_input.split(',')] if ignored_input else []
@@ -329,5 +324,23 @@ with tab2:
                                 status, reason = verify_with_gemini(item['anchor'], item['instruction'], link_href, creds)
                             
                             final_report.append({
-                                "Page Title": page_title, "Status": status, "Anchor Text": item['anchor'],
-                                "Instruction": item['instruction'], "Found Link": link_href, "Reason": reas
+                                "Page Title": page_title, 
+                                "Status": status, 
+                                "Anchor Text": item['anchor'],
+                                "Instruction": item['instruction'], 
+                                "Found Link": link_href, 
+                                "Reason": reason
+                            })
+                    except Exception as e:
+                        final_report.append({"Page Title": page_title, "Status": "ERROR", "Reason": f"Website Error: {str(e)}"})
+
+                bar.progress((i+1)/len(links_to_process))
+            
+            status_text.text("Audit Complete!")
+            if final_report:
+                res_df = pd.DataFrame(final_report)
+                cols = ["Page Title", "Status", "Anchor Text", "Instruction", "Found Link", "Reason"]
+                res_df = res_df[[c for c in cols if c in res_df.columns]]
+                def color_row(val): return f'background-color: {"#f8d7da" if val == "FAIL" else "#d4edda" if val == "PASS" else "white"}'
+                st.dataframe(res_df.style.applymap(lambda x: 'color:red;font-weight:bold' if x=='FAIL' else 'color:green;font-weight:bold' if x=='PASS' else 'color:orange', subset=['Status']), use_container_width=True)
+                st.download_button("📥 Download Link Report CSV", res_df.to_csv(index=False).encode('utf-8'), "link_audit_report.csv", "text/csv")
