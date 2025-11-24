@@ -83,7 +83,6 @@ def get_web_text_clean(url):
         for tag in soup(["script", "style", "noscript", "iframe", "svg"]): 
             tag.decompose()
         
-        # --- NEW LOGIC START ---
         # 1. Look for the Developer's Class
         content_area = soup.find(class_="page-content-area")
         
@@ -96,7 +95,6 @@ def get_web_text_clean(url):
             for selector in oxy_junk:
                 for tag in soup.select(selector): tag.decompose()
             text = soup.get_text(separator='\n')
-        # --- NEW LOGIC END ---
 
         return text.strip()
     except Exception as e:
@@ -121,27 +119,21 @@ def get_doc_comments(creds, doc_url):
 def check_oxygen_link(html_content, anchor_text):
     soup = BeautifulSoup(html_content, 'html.parser')
     
-    # --- NEW LOGIC START ---
     # Define Search Scope: Use 'page-content-area' if available
     content_area = soup.find(class_="page-content-area")
     search_scope = content_area if content_area else soup
 
     if not content_area:
-        # Only decompose headers if we are searching the whole page
         for rubbish in soup.select('.ct-header, .ct-footer, header, footer, .oxy-nav-menu'): 
             rubbish.decompose()
-    # --- NEW LOGIC END ---
 
-    # Smart Search: Find the text, then look Up (Parents)
     pattern = re.compile(re.escape(anchor_text), re.IGNORECASE)
     target = search_scope.find(string=pattern)
     
     if target:
-        # 1. Check if the element itself is an <a> tag
         if target.parent.name == 'a' and target.parent.has_attr('href'):
             return target.parent['href'], "Found (Direct)"
             
-        # 2. Walk UP (Oxygen Link Wrappers) - Depth 12
         curr = target.parent
         steps = 0
         while curr and steps < 12:
@@ -157,18 +149,13 @@ def check_oxygen_link(html_content, anchor_text):
 def verify_with_gemini(anchor, instruction, link, creds):
     if not link: return "FAIL", "Link missing"
     try:
-        # Explicitly set location to 'us-central1'
         vertexai.init(project=creds.project_id, location="us-central1", credentials=creds)
-        
-        # Use specific model version
         model = GenerativeModel("gemini-1.5-flash-001")
-        
         prompt = f"""
         You are a QA Bot.
         Text: "{anchor}"
         Instruction: "{instruction}"
         Link found: "{link}"
-        
         Does the Link satisfy the Instruction? 
         Return JSON ONLY: {{ "status": "PASS" or "FAIL", "reason": "short explanation" }}
         """
@@ -242,8 +229,13 @@ with tab1:
                 status = "MATCH" if sim > 95 else "MISMATCH"
                 if "Error" in doc_txt or "Error" in web_txt: status = "ERROR"
                 
+                # STORE URLs for the CSV export
                 st.session_state['qc_results'].append({
-                    "Title": row.get('Page Title'), "Status": status, "Score": sim,
+                    "Title": row.get('Page Title'), 
+                    "Status": status, 
+                    "Score": sim,
+                    "Live URL": url,
+                    "Doc URL": doc_url,
                     "Diff": create_diff(doc_norm, web_norm) if status == "MISMATCH" else None
                 })
                 bar.progress((i+1)/len(rows))
@@ -251,9 +243,34 @@ with tab1:
             
     if st.session_state['qc_results']:
         df = pd.DataFrame(st.session_state['qc_results'])
+        
+        # Display Logic (Hide raw URLs and Diff from visual table for cleanliness)
+        display_df = df[["Title", "Status", "Score"]]
+        
         def color_status(val):
             return f'background-color: {"#d4edda" if val == "MATCH" else "#f8d7da" if val == "MISMATCH" else "#fff3cd"}'
-        st.dataframe(df[["Title", "Status", "Score"]].style.applymap(color_status, subset=['Status']), use_container_width=True)
+        
+        st.dataframe(display_df.style.applymap(color_status, subset=['Status']), use_container_width=True)
+
+        # --- DOWNLOAD SECTION ---
+        col_d1, col_d2 = st.columns(2)
+        
+        # 1. Full Report
+        csv_full = df.drop(columns=['Diff'], errors='ignore').to_csv(index=False).encode('utf-8')
+        with col_d1:
+            st.download_button("📥 Download Full Report", csv_full, "full_qc_report.csv", "text/csv")
+        
+        # 2. Fix Ticket (Mismatches Only)
+        mismatch_df = df[(df['Status'] == 'MISMATCH') | (df['Status'] == 'ERROR')].drop(columns=['Diff'], errors='ignore')
+        if not mismatch_df.empty:
+            csv_mismatch = mismatch_df.to_csv(index=False).encode('utf-8')
+            with col_d2:
+                st.download_button("🚨 Download Fix Ticket (Failures Only)", csv_mismatch, "needed_fixes.csv", "text/csv", type="primary")
+        else:
+            with col_d2:
+                st.success("No fixes needed! 🎉")
+
+        # Inspector
         sel = st.selectbox("Inspect Mismatch", df[df['Status']=="MISMATCH"]['Title'].unique())
         if sel:
             d = next(item for item in st.session_state['qc_results'] if item["Title"] == sel)
