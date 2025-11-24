@@ -194,7 +194,7 @@ def create_diff(doc, web):
     return d.make_file(doc.splitlines(), web.splitlines(), fromdesc="Doc", todesc="Web")
 
 # --- UI START ---
-st.title("🏔️ Everest Content QC & Link Agent")
+st.title("Content QC & Link Agent")
 
 # Sidebar Auth
 with st.sidebar:
