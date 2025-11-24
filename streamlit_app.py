@@ -6,43 +6,65 @@ import re
 import difflib
 import textwrap
 import unicodedata
-import zipfile
 import io
 import csv
+import glob
+import json
+import openai
 from bs4 import BeautifulSoup
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
+from requests.auth import HTTPBasicAuth
 
 # --- CONFIGURATION ---
-st.set_page_config(page_title="QC Tool", page_icon="✅", layout="wide")
+st.set_page_config(page_title="QC & Link Agent", page_icon="🏔️", layout="wide")
 
-# Initialize Session State to hold results
 if 'qc_results' not in st.session_state:
     st.session_state['qc_results'] = []
+if 'link_results' not in st.session_state:
+    st.session_state['link_results'] = []
 
 # --- AUTHENTICATION ---
-def get_service(json_file):
-    try:
-        import json
-        file_content = json_file.getvalue().decode("utf-8")
-        creds_dict = json.loads(file_content)
-        
-        creds = service_account.Credentials.from_service_account_info(
-            creds_dict, scopes=["https://www.googleapis.com/auth/documents.readonly"]
-        )
-        return build("docs", "v1", credentials=creds)
-    except Exception as e:
-        st.error(f"❌ Auth Error: {e}")
-        return None
+def get_creds(uploaded_key=None):
+    creds_info = None
+    # 1. Check Streamlit Secrets
+    if "gcp_service_account" in st.secrets:
+        try:
+            creds_info = dict(st.secrets["gcp_service_account"])
+            if "private_key" in creds_info:
+                creds_info["private_key"] = creds_info["private_key"].replace("\\n", "\n")
+        except Exception:
+            pass
 
-# --- SCRAPERS ---
-def get_doc_text(service, doc_url):
+    # 2. Check Upload
+    if not creds_info and uploaded_key:
+        try:
+            creds_info = json.loads(uploaded_key.getvalue().decode("utf-8"))
+        except Exception:
+            pass
+
+    # 3. Check Local File
+    if not creds_info:
+        for k in glob.glob("*.json"):
+            if "service_account" in k or "qc" in k:
+                try:
+                    with open(k, "r") as f:
+                        creds_info = json.load(f)
+                        break
+                except: continue
+
+    if creds_info:
+        return service_account.Credentials.from_service_account_info(
+            creds_info, 
+            scopes=["https://www.googleapis.com/auth/documents.readonly", "https://www.googleapis.com/auth/drive.readonly"]
+        )
+    return None
+
+# --- TEXT EXTRACTORS (QC TOOL) ---
+def get_doc_text(creds, doc_url):
     try:
-        if "/d/" in doc_url:
-            doc_id = doc_url.split("/d/")[1].split("/")[0]
-        else:
-            doc_id = doc_url
-        
+        service = build("docs", "v1", credentials=creds)
+        doc_id = re.search(r'/d/([a-zA-Z0-9-_]+)', doc_url).group(1)
         doc = service.documents().get(documentId=doc_id).execute()
         text = ""
         for value in doc.get('body').get('content'):
@@ -53,39 +75,35 @@ def get_doc_text(service, doc_url):
     except Exception as e:
         return f"Error: {e}"
 
-def get_web_text(url):
+def get_web_text_clean(url, auth=None):
+    """
+    Optimized for Oxygen Builder to strip Headers, Footers, and hidden mobile menus.
+    """
     try:
-        headers = {'User-Agent': 'Mozilla/5.0'}
-        resp = requests.get(url, headers=headers, timeout=20)
+        headers = {'User-Agent': 'Mozilla/5.0 (QC-Bot)'}
+        resp = requests.get(url, headers=headers, auth=auth, timeout=20)
         resp.raise_for_status()
         
         soup = BeautifulSoup(resp.text, 'html.parser')
         
-        for tag in soup(["script", "style", "nav", "footer", "iframe", "noscript", "aside", "header", "head", "title", "meta"]):
+        # 1. Standard Cleanup
+        for tag in soup(["script", "style", "noscript", "iframe", "svg"]):
             tag.decompose()
 
-        junk_selectors = [
-            # Standard / Cookie
-            "#cookie-law-info-bar", ".cli-modal", "#cookie-law-info-again", 
-            ".moove-gdpr-cookie-compliance", "#moove_gdpr_cookie_modal",
-            
-            # Standard Theme Structures
-            ".site-header", "#masthead", ".main-navigation", ".top-bar",
-            
-            # Breadcrumbs (Added Rank Math)
-            ".breadcrumbs", ".breadcrumb", "#breadcrumbs", ".yoast-breadcrumbs",
-            ".rank-math-breadcrumb", # <--- Added for Rank Math
-            
-            # Accessibility & Hidden
-            ".screen-reader-text", ".sr-only", ".visually-hidden", ".elementor-screen-only",
-            ".hidden-desktop", ".hidden-mobile", ".hide-on-desktop", ".hide-on-mobile",
-            
-            # Oxygen Builder Specifics
-            ".oxy-nav-menu-hamburger-wrap", # Mobile menu often hidden but present
-            ".oxy-header-container",        # Common Oxygen Header wrapper
-            ".ct-section-inner-wrap > .oxy-nav-menu" # Oxygen menus
+        # 2. Oxygen & WordPress Specific Cleanup (Crucial for Oxygen)
+        # Oxygen often duplicates menus for mobile, confusing the text scraper.
+        oxy_junk = [
+            "header", "footer", 
+            ".ct-header", ".ct-footer",         # Oxygen Headers/Footers
+            ".oxy-header-container",            # Oxygen Container
+            ".oxy-nav-menu",                    # Oxygen Menus
+            ".ct-mobile-menu-icon",             # Mobile Triggers
+            "#masthead", ".site-footer",        # Standard WP
+            ".screen-reader-text", ".visually-hidden",
+            "#cookie-law-info-bar", ".moove-gdpr-cookie-compliance" # Cookie banners
         ]
-        for selector in junk_selectors:
+        
+        for selector in oxy_junk:
             for tag in soup.select(selector):
                 tag.decompose()
             
@@ -94,220 +112,221 @@ def get_web_text(url):
     except Exception as e:
         return f"Error: {e}"
 
-def clean_web_content(web_text, doc_text):
-    if not doc_text or not web_text:
-        return web_text
-    
-    FOOTER_MARKERS = [
-        "2025 All Rights Reserved", "Schedule a Consultation", 
-        "Updates", "Testosterone Test", "Our Locations", 
-        "Powered by GDPR", "Contact Us", "Subscribe"
-    ]
-    for marker in FOOTER_MARKERS:
-        idx = web_text.find(marker)
-        if idx != -1:
-            if idx > len(web_text) * 0.3: 
-                web_text = web_text[:idx]
-
-    NOISE_PHRASES = [
-        "book an appointment", "location", "woodbury, mn", 
-        "plymouth, mn", "eagan, mn", "patient portal",
-        "call us", "request an appointment",
-        "name", "email", "phone", "message", "send", "subscribe",
-        "contact us", "close", "square",
-        "privacy overview", "strictly necessary cookies", "accept", 
-        "close gdpr cookie settings", "gdpr cookie compliance", 
-        "we are using cookies to give you the best experience on our website.",
-        "name *", "email *", "phone *", "message *", "required",
-        "skip to content", "open menu", "close menu"
-    ]
-    
-    clean_lines = []
-    for line in web_text.splitlines():
-        line_stripped = line.strip()
-        if not line_stripped: continue
-        if line_stripped.lower() in NOISE_PHRASES: continue
-        clean_lines.append(line_stripped)
-    
-    web_text = "\n".join(clean_lines)
-
-    doc_words = re.findall(r'\S+', doc_text)
-    if len(doc_words) < 20: return web_text
-
-    def smart_escape(word):
-        escaped = re.escape(word)
-        for char in ['.', ',', '!', '?', ';', ':']:
-            if word.endswith(char):
-                target = re.escape(char)
-                escaped = escaped.replace(target, r"\s*" + target)
-        return escaped
-
-    first_doc_line = next((line for line in doc_text.splitlines() if line.strip()), None)
-    if first_doc_line:
-        title_anchor = re.escape(first_doc_line.strip())
-        match_title = re.search(title_anchor, web_text)
-        if match_title:
-             web_text = web_text[match_title.start():]
-
-    end_words = doc_words[-10:]
-    end_pattern = r"\s+".join([smart_escape(w) for w in end_words])
-    match_end = re.search(end_pattern, web_text)
-    
-    if match_end:
-        web_text = web_text[:match_end.end()]
-    else:
-        end_words_short = doc_words[-5:]
-        end_pattern_short = r"\s+".join([smart_escape(w) for w in end_words_short])
-        match_end_short = re.search(end_pattern_short, web_text)
-        if match_end_short:
-            web_text = web_text[:match_end_short.end()]
-            
-    return web_text
-
-def normalize_punctuation(text):
-    if not text: return ""
-    text = unicodedata.normalize("NFKD", text)
-    replacements = {
-        '“': '"', '”': '"', "‘": "'", "’": "'",
-        '–': '-', '—': '-', '…': '...', '\xa0': ' ', '\u200b': ''
-    }
-    for old, new in replacements.items():
-        text = text.replace(old, new)
-    return text.lower()
-
-def normalize_flow_text(text):
-    if not text: return ""
-    text = normalize_punctuation(text)
-    words = text.split()
-    stream = " ".join(words)
-    return textwrap.fill(stream, width=80)
-
-def create_html_diff(doc_text, web_text):
-    doc_lines = doc_text.splitlines()
-    web_lines = web_text.splitlines()
-    differ = difflib.HtmlDiff(wrapcolumn=80)
-    return differ.make_file(doc_lines, web_lines, fromdesc="Google Doc", todesc="Website")
-
-# --- UI LOGIC ---
-st.title("🚀 Website Quality Control Tool")
-
-st.markdown("""
-1. Upload your **Service Account JSON Key**.
-2. Upload your **Checklist CSV** (Columns: `Page Title`, `URL`, `google_doc_url`).
-3. Click **Run QC**.
-""")
-
-col1, col2 = st.columns(2)
-with col1:
-    key_file = st.file_uploader("🔑 Upload JSON Key", type=["json"])
-with col2:
-    csv_file = st.file_uploader("📂 Upload Checklist CSV", type=["csv"])
-
-if st.button("Run QC", type="primary"):
-    if not key_file or not csv_file:
-        st.error("Please upload both files first!")
-    else:
-        service = get_service(key_file)
+# --- LINK EXTRACTORS (LINK AGENT) ---
+def get_doc_comments(creds, doc_url):
+    try:
+        doc_id = re.search(r'/d/([a-zA-Z0-9-_]+)', doc_url).group(1)
+        service = build('drive', 'v3', credentials=creds)
         
-        if service:
-            # Read CSV
+        # Drive API is better for comments than Docs API
+        results = service.comments().list(
+            fileId=doc_id, 
+            fields="comments(content, quotedFileContent, author)"
+        ).execute()
+        
+        links_to_check = []
+        for c in results.get('comments', []):
+            if 'quotedFileContent' in c:
+                links_to_check.append({
+                    'anchor': c['quotedFileContent']['value'].strip(),
+                    'instruction': c['content'].strip(),
+                    'author': c['author']['displayName']
+                })
+        return links_to_check
+    except Exception as e:
+        return []
+
+def check_oxygen_link(html_content, anchor_text):
+    """
+    Finds links in Oxygen's nested DIV structure.
+    """
+    soup = BeautifulSoup(html_content, 'html.parser')
+    
+    # Clean header/footer to ensure we are checking the BODY content
+    for rubbish in soup.select('.ct-header, .ct-footer, header, footer'):
+        rubbish.decompose()
+
+    # Regex for case-insensitive match, handling potential whitespace
+    pattern = re.compile(re.escape(anchor_text), re.IGNORECASE)
+    target = soup.find(string=pattern)
+    
+    if target:
+        # Recursively search parents for an <a> tag (Oxygen Link Wrappers)
+        curr = target.parent
+        steps = 0
+        while curr and steps < 8: # Go up 8 levels max
+            if curr.name == 'a' and curr.has_attr('href'):
+                return curr['href'], "Found"
+            curr = curr.parent
+            steps += 1
+        return None, "Text found, but no Link Wrapper detected."
+    else:
+        return None, "Anchor text not found on page."
+
+def verify_ai_intent(anchor, instruction, link, api_key):
+    if not link: return "FAIL", "Link missing"
+    
+    client = openai.OpenAI(api_key=api_key)
+    prompt = f"""
+    Context: Website QA.
+    Text on page: "{anchor}"
+    Developer Instruction: "{instruction}"
+    Actual Link found: "{link}"
+    
+    Does the link fulfill the instruction? (Answer JSON: status: PASS/FAIL, reason: short string)
+    """
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[{"role": "user", "content": prompt}],
+            response_format={ "type": "json_object" }
+        )
+        data = json.loads(response.choices[0].message.content)
+        return data.get('status', 'FAIL'), data.get('reason', 'AI Error')
+    except:
+        return "ERROR", "AI Failed"
+
+# --- UTILS ---
+def normalize_text(text):
+    text = unicodedata.normalize("NFKD", text or "")
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
+
+def create_diff(doc, web):
+    d = difflib.HtmlDiff(wrapcolumn=80)
+    return d.make_file(doc.splitlines(), web.splitlines(), fromdesc="Doc", todesc="Web")
+
+# --- UI START ---
+st.title("🏔️ Everest Content QC & Link Agent")
+
+# Sidebar Auth
+with st.sidebar:
+    st.header("Settings")
+    uploaded_key = st.file_uploader("Service Account JSON", type="json")
+    openai_key = st.text_input("OpenAI Key (For Link Agent)", type="password")
+    
+    st.divider()
+    st.subheader("Staging Creds")
+    use_staging = st.checkbox("Staging Mode")
+    staging_domain = st.text_input("Staging Domain", "")
+    staging_user = st.text_input("User", "")
+    staging_pass = st.text_input("Pass", type="password")
+
+creds = get_creds(uploaded_key)
+auth = HTTPBasicAuth(staging_user, staging_pass) if staging_user else None
+
+if not creds:
+    st.error("Please upload Google Service Account JSON or set secrets.")
+    st.stop()
+
+# TABS
+tab1, tab2 = st.tabs(["📝 Text Comparison", "🔗 Link Auditor"])
+
+# --- TAB 1: TEXT QC ---
+with tab1:
+    st.subheader("Bulk Text Comparison")
+    csv_file = st.file_uploader("Upload Checklist CSV", type="csv", key="csv1")
+    
+    if st.button("Run Text QC"):
+        if csv_file:
             stringio = io.StringIO(csv_file.getvalue().decode("utf-8-sig"))
-            reader = csv.DictReader(stringio)
-            rows = list(reader)
+            rows = list(csv.DictReader(stringio))
             
-            # Clear previous results
             st.session_state['qc_results'] = []
-            
-            progress_bar = st.progress(0)
-            status_text = st.empty()
+            bar = st.progress(0)
             
             for i, row in enumerate(rows):
-                title = row.get('Page Title', 'Unknown')
-                web_url = row.get('URL', '').strip()
-                doc_url = row.get('google_doc_url', '').strip()
+                url = row.get('URL', '')
+                if use_staging and staging_domain:
+                     # Simple logic to swap domain
+                     from urllib.parse import urlparse
+                     path = urlparse(url).path
+                     url = f"https://{staging_domain}{path}"
+
+                doc_txt = get_doc_text(creds, row.get('google_doc_url', ''))
+                web_txt = get_web_text_clean(url, auth)
                 
-                status_text.text(f"Processing: {title}")
-                progress_bar.progress((i + 1) / len(rows))
+                # Normalize
+                doc_norm = normalize_text(doc_txt)
+                web_norm = normalize_text(web_txt)
                 
-                if not web_url or not doc_url:
-                    continue
-
-                # Process
-                doc_text = get_doc_text(service, doc_url)
-                web_text = get_web_text(web_url)
-                
-                error_msg = None
-                if "Error:" in doc_text: error_msg = doc_text
-                if "Error:" in web_text: error_msg = web_text
-
-                if error_msg:
-                    st.session_state['qc_results'].append({
-                        "Page Title": title, "Status": "ERROR", 
-                        "Similarity": 0.0, "Notes": error_msg,
-                        "html_diff": None
-                    })
-                    continue
-
-                clean_web = clean_web_content(web_text, doc_text)
-                doc_norm = normalize_flow_text(doc_text)
-                web_norm = normalize_flow_text(clean_web)
-
+                # Check match
                 seq = difflib.SequenceMatcher(None, doc_norm, web_norm)
-                similarity = seq.ratio() * 100
-                status = "MATCH" if similarity > 95 else "MISMATCH"
+                sim = round(seq.ratio() * 100, 2)
+                status = "MATCH" if sim > 95 else "MISMATCH"
                 
-                html_diff = None
-                if status == "MISMATCH":
-                    html_diff = create_html_diff(doc_norm, web_norm)
-
                 st.session_state['qc_results'].append({
-                    "Page Title": title, "Status": status, 
-                    "Similarity": round(similarity, 2), "Notes": "OK" if status == "MATCH" else "Review Needed",
-                    "html_diff": html_diff
+                    "Title": row.get('Page Title'),
+                    "Status": status,
+                    "Score": sim,
+                    "Diff": create_diff(doc_norm, web_norm) if status == "MISMATCH" else None
                 })
-
-            status_text.text("✅ QC Complete!")
-
-# --- DISPLAY RESULTS ---
-if st.session_state['qc_results']:
-    
-    # 1. Summary Table
-    df = pd.DataFrame(st.session_state['qc_results'])
-    
-    # Color coding helper
-    def highlight_status(val):
-        color = 'green' if val == 'MATCH' else 'red'
-        return f'color: {color}; font-weight: bold'
-
-    st.subheader("📊 Summary")
-    st.dataframe(
-        df[["Page Title", "Status", "Similarity", "Notes"]].style.applymap(highlight_status, subset=['Status']),
-        use_container_width=True
-    )
-    
-    # 2. Bulk Download
-    csv_buffer = df[["Page Title", "Status", "Similarity", "Notes"]].to_csv(index=False).encode('utf-8')
-    st.download_button("📥 Download Results (CSV)", csv_buffer, "QC_Results.csv", "text/csv")
-
-    # 3. Detailed Inspector
-    st.divider()
-    st.subheader("🔍 Detailed Inspector")
-    
-    mismatches = [r for r in st.session_state['qc_results'] if r['Status'] == 'MISMATCH' or r['Status'] == 'ERROR']
-    
-    if not mismatches:
-        st.success("🎉 Everything matches! No detailed inspection needed.")
-    else:
-        page_titles = [r['Page Title'] for r in mismatches]
-        selected_page_title = st.selectbox("Select a page to inspect:", page_titles)
+                bar.progress((i+1)/len(rows))
+            
+    if st.session_state['qc_results']:
+        df = pd.DataFrame(st.session_state['qc_results'])
+        st.dataframe(df[["Title", "Status", "Score"]])
         
-        # Find the data for selected page
-        selected_data = next((item for item in mismatches if item["Page Title"] == selected_page_title), None)
-        
-        if selected_data:
-            st.info(f"Similarity Score: {selected_data['Similarity']}%")
-            if selected_data['html_diff']:
-                # Render the HTML Diff
-                components.html(selected_data['html_diff'], height=600, scrolling=True)
+        # Inspector
+        sel = st.selectbox("Inspect Mismatch", df[df['Status']=="MISMATCH"]['Title'].unique())
+        if sel:
+            d = next(item for item in st.session_state['qc_results'] if item["Title"] == sel)
+            components.html(d['Diff'], height=600, scrolling=True)
+
+# --- TAB 2: LINK AUDIT ---
+with tab2:
+    st.subheader("Link Functionality & Intent Audit")
+    st.markdown("Checks if **Google Doc Comments** match **Live Oxygen Links**.")
+    
+    l_doc = st.text_input("Google Doc URL")
+    l_url = st.text_input("Live Page URL")
+    
+    if st.button("Run Link Audit"):
+        if not openai_key:
+            st.error("OpenAI Key required for Intent Check.")
+        elif not l_doc or not l_url:
+            st.error("URLs required.")
+        else:
+            with st.spinner("Fetching comments..."):
+                comments = get_doc_comments(creds, l_doc)
+            
+            if not comments:
+                st.warning("No comments found in Doc.")
             else:
-                st.warning("No visual report available (likely an error scraping the page).")
+                st.info(f"Checking {len(comments)} links on {l_url}...")
+                
+                # Fetch Web Content ONCE to save requests
+                resp = requests.get(l_url, auth=auth, headers={'User-Agent': 'QC-Bot'})
+                html_content = resp.text
+                
+                results = []
+                bar = st.progress(0)
+                
+                for i, item in enumerate(comments):
+                    # 1. Technical Check (Oxygen Logic)
+                    link_href, status_msg = check_oxygen_link(html_content, item['anchor'])
+                    
+                    # 2. AI Check
+                    status, reason = "MISSING", status_msg
+                    if link_href:
+                        status, reason = verify_ai_intent(item['anchor'], item['instruction'], link_href, openai_key)
+                    
+                    results.append({
+                        "Anchor": item['anchor'],
+                        "Instruction": item['instruction'],
+                        "Found Link": link_href,
+                        "Status": status,
+                        "Reason": reason
+                    })
+                    bar.progress((i+1)/len(comments))
+                
+                res_df = pd.DataFrame(results)
+                
+                def color_row(val):
+                    color = '#d4edda' if val == 'PASS' else '#f8d7da' if val == 'FAIL' else '#fff3cd'
+                    return f'background-color: {color}'
+                
+                st.dataframe(res_df.style.applymap(lambda x: 'color:red' if x == 'FAIL' else 'color:green', subset=['Status']), use_container_width=True)
+                
+                csv = res_df.to_csv(index=False).encode('utf-8')
+                st.download_button("Download CSV", csv, "link_audit.csv", "text/csv")
