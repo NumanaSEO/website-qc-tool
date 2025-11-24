@@ -25,7 +25,7 @@ if 'qc_results' not in st.session_state:
 def get_creds(uploaded_key=None):
     creds_info = None
     
-    # 1. Check Streamlit Secrets (Cloud / Local secrets.toml)
+    # 1. Check Streamlit Secrets
     if "gcp_service_account" in st.secrets:
         try:
             creds_info = dict(st.secrets["gcp_service_account"])
@@ -34,7 +34,7 @@ def get_creds(uploaded_key=None):
         except Exception:
             pass
 
-    # 2. Check Upload (Sidebar)
+    # 2. Check Upload
     if not creds_info and uploaded_key:
         try:
             creds_info = json.loads(uploaded_key.getvalue().decode("utf-8"))
@@ -58,7 +58,7 @@ def get_creds(uploaded_key=None):
         )
     return None
 
-# --- TEXT EXTRACTORS (QC TOOL) ---
+# --- TEXT EXTRACTORS ---
 def get_doc_text(creds, doc_url):
     try:
         service = build("docs", "v1", credentials=creds)
@@ -77,14 +77,10 @@ def get_doc_text(creds, doc_url):
         return f"Error: {e}"
 
 def get_web_text_clean(url):
-    """
-    Scrapes text while removing Oxygen Builder headers/footers and hidden menus.
-    """
     try:
         headers = {'User-Agent': 'Mozilla/5.0 (QC-Bot)'}
         resp = requests.get(url, headers=headers, timeout=20)
         resp.raise_for_status()
-        
         soup = BeautifulSoup(resp.text, 'html.parser')
         
         for tag in soup(["script", "style", "noscript", "iframe", "svg"]):
@@ -106,15 +102,13 @@ def get_web_text_clean(url):
     except Exception as e:
         return f"Error: {e}"
 
-# --- LINK EXTRACTORS (LINK AGENT) ---
+# --- LINK EXTRACTORS ---
 def get_doc_comments(creds, doc_url):
     try:
         match = re.search(r'/d/([a-zA-Z0-9-_]+)', doc_url)
         if not match: return []
         doc_id = match.group(1)
-        
         service = build('drive', 'v3', credentials=creds)
-        
         results = service.comments().list(
             fileId=doc_id, 
             fields="comments(content, quotedFileContent, author)"
@@ -133,7 +127,6 @@ def get_doc_comments(creds, doc_url):
 
 def check_oxygen_link(html_content, anchor_text):
     soup = BeautifulSoup(html_content, 'html.parser')
-    
     for rubbish in soup.select('.ct-header, .ct-footer, header, footer, .oxy-nav-menu'):
         rubbish.decompose()
 
@@ -154,7 +147,6 @@ def check_oxygen_link(html_content, anchor_text):
 
 def verify_with_gemini(anchor, instruction, link, creds):
     if not link: return "FAIL", "Link missing"
-    
     try:
         vertexai.init(project=creds.project_id, credentials=creds)
         model = GenerativeModel("gemini-1.5-flash")
@@ -164,12 +156,7 @@ def verify_with_gemini(anchor, instruction, link, creds):
         1. Text on page: "{anchor}"
         2. Content Writer's Instruction: "{instruction}"
         3. Actual Link found in code: "{link}"
-        
         Task: Does the 'Actual Link' satisfy the 'Instruction'? 
-        For example:
-        - Instruction: "Link to contact" -> Link: "/contact-us" (PASS)
-        - Instruction: "Link to TRT" -> Link: "/services/hormones" (FAIL? Depends on context, use best judgment)
-        
         Return JSON ONLY: {{ "status": "PASS" or "FAIL", "reason": "short explanation" }}
         """
         
@@ -177,10 +164,8 @@ def verify_with_gemini(anchor, instruction, link, creds):
             prompt,
             generation_config=GenerationConfig(response_mime_type="application/json")
         )
-        
         data = json.loads(response.text)
         return data.get('status', 'FAIL'), data.get('reason', 'AI Error')
-        
     except Exception as e:
         return "ERROR", str(e)
 
@@ -197,32 +182,24 @@ def create_diff(doc, web):
 # --- UI START ---
 st.title("Content QC & Link Agent")
 
-# --- SIDEBAR AUTH & CONFIG ---
 with st.sidebar:
     st.header("Settings")
-    
-    # 1. AUTHENTICATION
-    uploaded_key = None
     if "gcp_service_account" in st.secrets:
         st.success("✅ Authenticated via Secrets")
+        uploaded_key = None
     else:
         uploaded_key = st.file_uploader("Service Account JSON", type="json")
     
     st.divider()
-
-    # 2. OPTIONAL DOMAIN SWAP
-    # Removed User/Pass logic since site is not password protected.
-    # Only keep Domain Swap if the user needs to test Dev URLs using Live CSV data.
     use_staging = st.checkbox("Override Domain (Optional)")
     staging_domain = ""
     if use_staging:
-        st.caption("Useful if your CSV has Live URLs but you want to test Dev.")
+        st.caption("Useful if CSV has Live URLs but testing Dev.")
         staging_domain = st.text_input("New Domain", placeholder="e.g. wordpress-123.cloudwaysapps.com")
 
 creds = get_creds(uploaded_key)
-
 if not creds:
-    st.error("Please configure secrets.toml or upload a JSON key to proceed.")
+    st.error("Please configure secrets.toml or upload a JSON key.")
     st.stop()
 
 # TABS
@@ -231,41 +208,34 @@ tab1, tab2 = st.tabs(["📝 Text Comparison", "🔗 Link Auditor"])
 # --- TAB 1: TEXT QC ---
 with tab1:
     st.subheader("Bulk Text Comparison")
-    st.caption("Upload a CSV with columns: `Page Title`, `URL`, `google_doc_url`")
-    csv_file = st.file_uploader("Upload Checklist CSV", type="csv", key="csv1")
+    csv_file_text = st.file_uploader("Upload Checklist CSV", type="csv", key="csv_text")
     
     if st.button("Run Text QC"):
-        if csv_file:
-            stringio = io.StringIO(csv_file.getvalue().decode("utf-8-sig"))
+        if csv_file_text:
+            stringio = io.StringIO(csv_file_text.getvalue().decode("utf-8-sig"))
             rows = list(csv.DictReader(stringio))
-            
             st.session_state['qc_results'] = []
             bar = st.progress(0)
             status_text = st.empty()
             
             for i, row in enumerate(rows):
                 url = row.get('URL', '')
-                doc_url_input = row.get('google_doc_url', '')
-                
-                # Domain Swap Logic
+                doc_url = row.get('google_doc_url', '')
                 if use_staging and staging_domain:
                      from urllib.parse import urlparse
                      path = urlparse(url).path
                      url = f"https://{staging_domain}{path}"
 
                 status_text.text(f"Checking: {row.get('Page Title')}...")
-                
-                doc_txt = get_doc_text(creds, doc_url_input)
+                doc_txt = get_doc_text(creds, doc_url)
                 web_txt = get_web_text_clean(url)
                 
                 doc_norm = normalize_text(doc_txt)
                 web_norm = normalize_text(web_txt)
-                
                 seq = difflib.SequenceMatcher(None, doc_norm, web_norm)
                 sim = round(seq.ratio() * 100, 2)
                 status = "MATCH" if sim > 95 else "MISMATCH"
-                if "Error" in doc_txt or "Error" in web_txt:
-                    status = "ERROR"
+                if "Error" in doc_txt or "Error" in web_txt: status = "ERROR"
                 
                 st.session_state['qc_results'].append({
                     "Title": row.get('Page Title'),
@@ -278,77 +248,119 @@ with tab1:
             
     if st.session_state['qc_results']:
         df = pd.DataFrame(st.session_state['qc_results'])
-        
         def color_status(val):
             color = '#d4edda' if val == 'MATCH' else '#f8d7da' if val == 'MISMATCH' else '#fff3cd'
             return f'background-color: {color}'
-
         st.dataframe(df[["Title", "Status", "Score"]].style.applymap(color_status, subset=['Status']), use_container_width=True)
-        
         sel = st.selectbox("Inspect Mismatch", df[df['Status']=="MISMATCH"]['Title'].unique())
         if sel:
             d = next(item for item in st.session_state['qc_results'] if item["Title"] == sel)
             components.html(d['Diff'], height=600, scrolling=True)
 
-# --- TAB 2: LINK AUDIT ---
+# --- TAB 2: LINK AUDITOR ---
 with tab2:
     st.subheader("Link Functionality & Intent Audit")
     
-    col_l1, col_l2 = st.columns(2)
-    with col_l1:
-        l_doc = st.text_input("Google Doc URL (must have comments)")
-    with col_l2:
-        l_url = st.text_input("Live Page URL")
+    # Mode Selection
+    mode = st.radio("Choose Input Method:", ["Bulk CSV Upload", "Single Page Check"], horizontal=True)
     
+    # Logic Container
+    links_to_process = [] # list of dicts: {title, doc_url, live_url}
+
+    if mode == "Single Page Check":
+        col_l1, col_l2 = st.columns(2)
+        with col_l1: l_doc = st.text_input("Google Doc URL")
+        with col_l2: l_url = st.text_input("Live Page URL")
+        if l_doc and l_url:
+            links_to_process.append({"Page Title": "Single Check", "URL": l_url, "google_doc_url": l_doc})
+
+    else: # Bulk CSV
+        csv_file_links = st.file_uploader("Upload Checklist CSV", type="csv", key="csv_links")
+        if csv_file_links:
+            stringio = io.StringIO(csv_file_links.getvalue().decode("utf-8-sig"))
+            links_to_process = list(csv.DictReader(stringio))
+
     if st.button("Run Link Audit"):
-        if not l_doc or not l_url:
-            st.error("Both URLs are required.")
+        if not links_to_process:
+            st.error("Please provide a CSV or Single URL to process.")
         else:
-            # Domain Swap Logic
-            if use_staging and staging_domain:
-                from urllib.parse import urlparse
-                path = urlparse(l_url).path
-                l_url = f"https://{staging_domain}{path}"
+            final_report = []
+            bar = st.progress(0)
+            status_text = st.empty()
             
-            with st.spinner("Fetching Google Doc comments..."):
-                comments = get_doc_comments(creds, l_doc)
-            
-            if not comments:
-                st.warning("No highlighted comments found in this Google Doc.")
-            else:
-                st.info(f"Found {len(comments)} instructions. Scanning {l_url}...")
+            # Iterate through pages
+            for i, row in enumerate(links_to_process):
+                page_title = row.get('Page Title', 'Unknown Page')
+                live_url = row.get('URL', '')
+                doc_url = row.get('google_doc_url', '')
+
+                if use_staging and staging_domain:
+                    from urllib.parse import urlparse
+                    path = urlparse(live_url).path
+                    live_url = f"https://{staging_domain}{path}"
                 
-                try:
-                    resp = requests.get(l_url, headers={'User-Agent': 'QC-Bot'})
-                    html_content = resp.text
-                    
-                    results = []
-                    bar = st.progress(0)
-                    
-                    for i, item in enumerate(comments):
-                        # 1. Technical Check
-                        link_href, status_msg = check_oxygen_link(html_content, item['anchor'])
+                status_text.text(f"Scanning Page: {page_title}...")
+                
+                # 1. Get Comments
+                comments = get_doc_comments(creds, doc_url)
+                
+                if not comments:
+                    # Log that we checked but found nothing
+                    final_report.append({
+                        "Page Title": page_title,
+                        "Status": "INFO",
+                        "Anchor Text": "-",
+                        "Found Link": "-",
+                        "Reason": "No highlighted comments found in Doc"
+                    })
+                else:
+                    try:
+                        # 2. Scrape Page ONCE
+                        resp = requests.get(live_url, headers={'User-Agent': 'QC-Bot'})
+                        html_content = resp.text
                         
-                        # 2. AI Check
-                        status, reason = "MISSING", status_msg
-                        if link_href:
-                            status, reason = verify_with_gemini(item['anchor'], item['instruction'], link_href, creds)
-                        
-                        results.append({
-                            "Anchor Text": item['anchor'],
-                            "Instruction": item['instruction'],
-                            "Found Link": link_href,
-                            "Status": status,
-                            "Reason": reason
+                        # 3. Check every link on this page
+                        for item in comments:
+                            link_href, status_msg = check_oxygen_link(html_content, item['anchor'])
+                            
+                            status, reason = "MISSING", status_msg
+                            if link_href:
+                                status, reason = verify_with_gemini(item['anchor'], item['instruction'], link_href, creds)
+                            
+                            final_report.append({
+                                "Page Title": page_title,
+                                "Status": status,
+                                "Anchor Text": item['anchor'],
+                                "Instruction": item['instruction'],
+                                "Found Link": link_href,
+                                "Reason": reason
+                            })
+                    except Exception as e:
+                        final_report.append({
+                            "Page Title": page_title,
+                            "Status": "ERROR",
+                            "Reason": f"Could not load website: {str(e)}"
                         })
-                        bar.progress((i+1)/len(comments))
-                    
-                    res_df = pd.DataFrame(results)
-                    
-                    st.dataframe(res_df.style.applymap(lambda x: 'color:red; font-weight:bold' if x == 'FAIL' else 'color:green; font-weight:bold' if x == 'PASS' else 'color:orange', subset=['Status']), use_container_width=True)
-                    
-                    csv_dl = res_df.to_csv(index=False).encode('utf-8')
-                    st.download_button("📥 Download Audit CSV", csv_dl, "link_audit_report.csv", "text/csv")
+
+                bar.progress((i+1)/len(links_to_process))
+            
+            status_text.text("Link Audit Complete!")
+            
+            # Display Results
+            if final_report:
+                res_df = pd.DataFrame(final_report)
                 
-                except Exception as e:
-                    st.error(f"Failed to load website: {e}")
+                # Reorder columns nicely
+                cols = ["Page Title", "Status", "Anchor Text", "Instruction", "Found Link", "Reason"]
+                # Filter to ensure columns exist (in case of error rows)
+                existing_cols = [c for c in cols if c in res_df.columns]
+                res_df = res_df[existing_cols]
+
+                def color_link_row(val):
+                    color = '#f8d7da' if val == 'FAIL' else '#d4edda' if val == 'PASS' else 'white'
+                    return f'background-color: {color}'
+
+                st.dataframe(res_df.style.applymap(lambda x: 'color:red; font-weight:bold' if x == 'FAIL' else 'color:green; font-weight:bold' if x == 'PASS' else 'color:orange', subset=['Status']), use_container_width=True)
+                
+                csv_dl = res_df.to_csv(index=False).encode('utf-8')
+                st.download_button("📥 Download Link Report CSV", csv_dl, "link_audit_report.csv", "text/csv")
