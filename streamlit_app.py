@@ -70,27 +70,19 @@ def get_doc_text(creds, doc_url):
         return f"Error: {e}"
 
 def get_web_text_clean(url):
-    """
-    Extracts text ONLY from 'page-content-area' if it exists.
-    """
     try:
         headers = {'User-Agent': 'Mozilla/5.0 (QC-Bot)'}
         resp = requests.get(url, headers=headers, timeout=20)
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, 'html.parser')
         
-        # Always remove scripts/styles regardless of container
         for tag in soup(["script", "style", "noscript", "iframe", "svg"]): 
             tag.decompose()
         
-        # 1. Look for the Developer's Class
         content_area = soup.find(class_="page-content-area")
-        
         if content_area:
-            # Great! Only use text inside this div
             text = content_area.get_text(separator='\n')
         else:
-            # Fallback: Clean up standard junk if class is missing
             oxy_junk = ["header", "footer", ".ct-header", ".ct-footer", ".oxy-header-container", ".oxy-nav-menu", ".ct-mobile-menu-icon", "#masthead", ".site-footer", ".screen-reader-text", ".visually-hidden", "#cookie-law-info-bar", ".moove-gdpr-cookie-compliance"]
             for selector in oxy_junk:
                 for tag in soup.select(selector): tag.decompose()
@@ -101,25 +93,41 @@ def get_web_text_clean(url):
         return f"Error: {e}"
 
 # --- LINK EXTRACTORS ---
-def get_doc_comments(creds, doc_url):
+def get_doc_comments(creds, doc_url, ignored_authors=[]):
+    """
+    Fetches comments, optionally filtering out specific author names.
+    """
     try:
         match = re.search(r'/d/([a-zA-Z0-9-_]+)', doc_url)
         if not match: return "Error: Invalid URL"
         doc_id = match.group(1)
         service = build('drive', 'v3', credentials=creds)
-        results = service.comments().list(fileId=doc_id, fields="comments(content, quotedFileContent, author)").execute()
+        
+        # Request author field
+        results = service.comments().list(
+            fileId=doc_id, 
+            fields="comments(content, quotedFileContent, author(displayName))"
+        ).execute()
+        
         links = []
         for c in results.get('comments', []):
+            # Check if comments has highlighting
             if 'quotedFileContent' in c:
-                links.append({'anchor': c['quotedFileContent']['value'].strip(), 'instruction': c['content'].strip()})
+                # Check Author
+                author_name = c.get('author', {}).get('displayName', '')
+                if author_name in ignored_authors:
+                    continue
+                
+                links.append({
+                    'anchor': c['quotedFileContent']['value'].strip(), 
+                    'instruction': c['content'].strip()
+                })
         return links
     except Exception as e:
         return f"Error: {str(e)}"
 
 def check_oxygen_link(html_content, anchor_text):
     soup = BeautifulSoup(html_content, 'html.parser')
-    
-    # Define Search Scope: Use 'page-content-area' if available
     content_area = soup.find(class_="page-content-area")
     search_scope = content_area if content_area else soup
 
@@ -193,6 +201,12 @@ with st.sidebar:
         st.caption("Useful if CSV has Live URLs but testing Dev.")
         staging_domain = st.text_input("New Domain", placeholder="e.g. wordpress-123.cloudwaysapps.com")
 
+    st.divider()
+    # --- NEW FEATURE: IGNORE AUTHORS ---
+    st.caption("Filters")
+    ignored_input = st.text_input("Ignore Comments By:", placeholder="Name 1, Name 2")
+    ignored_authors = [x.strip() for x in ignored_input.split(',')] if ignored_input else []
+
 creds = get_creds(uploaded_key)
 if not creds:
     st.error("Please configure secrets.toml or upload a JSON key.")
@@ -229,7 +243,6 @@ with tab1:
                 status = "MATCH" if sim > 95 else "MISMATCH"
                 if "Error" in doc_txt or "Error" in web_txt: status = "ERROR"
                 
-                # STORE URLs for the CSV export
                 st.session_state['qc_results'].append({
                     "Title": row.get('Page Title'), 
                     "Status": status, 
@@ -243,34 +256,21 @@ with tab1:
             
     if st.session_state['qc_results']:
         df = pd.DataFrame(st.session_state['qc_results'])
-        
-        # Display Logic (Hide raw URLs and Diff from visual table for cleanliness)
         display_df = df[["Title", "Status", "Score"]]
-        
         def color_status(val):
             return f'background-color: {"#d4edda" if val == "MATCH" else "#f8d7da" if val == "MISMATCH" else "#fff3cd"}'
-        
         st.dataframe(display_df.style.applymap(color_status, subset=['Status']), use_container_width=True)
 
-        # --- DOWNLOAD SECTION ---
         col_d1, col_d2 = st.columns(2)
-        
-        # 1. Full Report
         csv_full = df.drop(columns=['Diff'], errors='ignore').to_csv(index=False).encode('utf-8')
-        with col_d1:
-            st.download_button("📥 Download Full Report", csv_full, "full_qc_report.csv", "text/csv")
+        with col_d1: st.download_button("📥 Download Full Report", csv_full, "full_qc_report.csv", "text/csv")
         
-        # 2. Fix Ticket (Mismatches Only)
         mismatch_df = df[(df['Status'] == 'MISMATCH') | (df['Status'] == 'ERROR')].drop(columns=['Diff'], errors='ignore')
         if not mismatch_df.empty:
-            csv_mismatch = mismatch_df.to_csv(index=False).encode('utf-8')
-            with col_d2:
-                st.download_button("🚨 Download Fix Ticket (Failures Only)", csv_mismatch, "needed_fixes.csv", "text/csv", type="primary")
+            with col_d2: st.download_button("🚨 Download Fix Ticket", mismatch_df.to_csv(index=False).encode('utf-8'), "needed_fixes.csv", "text/csv", type="primary")
         else:
-            with col_d2:
-                st.success("No fixes needed! 🎉")
+            with col_d2: st.success("No fixes needed! 🎉")
 
-        # Inspector
         sel = st.selectbox("Inspect Mismatch", df[df['Status']=="MISMATCH"]['Title'].unique())
         if sel:
             d = next(item for item in st.session_state['qc_results'] if item["Title"] == sel)
@@ -310,12 +310,14 @@ with tab2:
                     live_url = f"https://{staging_domain}{path}"
                 
                 status_text.text(f"Scanning: {page_title}...")
-                comments = get_doc_comments(creds, doc_url)
+                
+                # PASSING THE IGNORED AUTHORS LIST HERE
+                comments = get_doc_comments(creds, doc_url, ignored_authors=ignored_authors)
                 
                 if isinstance(comments, str) and comments.startswith("Error"):
                     final_report.append({"Page Title": page_title, "Status": "ERROR", "Reason": comments})
                 elif not comments:
-                    final_report.append({"Page Title": page_title, "Status": "INFO", "Reason": "No highlighted comments found"})
+                    final_report.append({"Page Title": page_title, "Status": "INFO", "Reason": "No relevant instructions found"})
                 else:
                     try:
                         resp = requests.get(live_url, headers={'User-Agent': 'QC-Bot'}, timeout=30)
@@ -328,18 +330,4 @@ with tab2:
                             
                             final_report.append({
                                 "Page Title": page_title, "Status": status, "Anchor Text": item['anchor'],
-                                "Instruction": item['instruction'], "Found Link": link_href, "Reason": reason
-                            })
-                    except Exception as e:
-                        final_report.append({"Page Title": page_title, "Status": "ERROR", "Reason": f"Website Error: {str(e)}"})
-
-                bar.progress((i+1)/len(links_to_process))
-            
-            status_text.text("Audit Complete!")
-            if final_report:
-                res_df = pd.DataFrame(final_report)
-                cols = ["Page Title", "Status", "Anchor Text", "Instruction", "Found Link", "Reason"]
-                res_df = res_df[[c for c in cols if c in res_df.columns]]
-                def color_row(val): return f'background-color: {"#f8d7da" if val == "FAIL" else "#d4edda" if val == "PASS" else "white"}'
-                st.dataframe(res_df.style.applymap(lambda x: 'color:red;font-weight:bold' if x=='FAIL' else 'color:green;font-weight:bold' if x=='PASS' else 'color:orange', subset=['Status']), use_container_width=True)
-                st.download_button("📥 Download Link Report CSV", res_df.to_csv(index=False).encode('utf-8'), "link_audit_report.csv", "text/csv")
+                                "Instruction": item['instruction'], "Found Link": link_href, "Reason": reas
