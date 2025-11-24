@@ -23,7 +23,6 @@ if 'qc_results' not in st.session_state:
 # --- AUTHENTICATION ---
 def get_creds(uploaded_key=None):
     creds_info = None
-    # Check Secrets
     if "gcp_service_account" in st.secrets:
         try:
             creds_info = dict(st.secrets["gcp_service_account"])
@@ -31,13 +30,11 @@ def get_creds(uploaded_key=None):
                 creds_info["private_key"] = creds_info["private_key"].replace("\\n", "\n")
         except Exception: pass
 
-    # Check Upload
     if not creds_info and uploaded_key:
         try:
             creds_info = json.loads(uploaded_key.getvalue().decode("utf-8"))
         except Exception: pass
 
-    # Check Local File
     if not creds_info:
         for k in glob.glob("*.json"):
             if "service_account" in k or "qc" in k:
@@ -123,7 +120,6 @@ def get_doc_comments(creds, doc_url, ignored_authors=[]):
 
 def check_oxygen_link(html_content, anchor_text):
     soup = BeautifulSoup(html_content, 'html.parser')
-    
     content_area = soup.find(class_="page-content-area")
     search_scope = content_area if content_area else soup
 
@@ -131,7 +127,7 @@ def check_oxygen_link(html_content, anchor_text):
         for rubbish in soup.select('.ct-header, .ct-footer, header, footer, .oxy-nav-menu'): 
             rubbish.decompose()
 
-    # Improved Fuzzy Search: Normalize spaces and case
+    # Fuzzy Match Logic
     clean_anchor = " ".join(anchor_text.split()).lower()
     all_text_nodes = search_scope.find_all(string=True)
     
@@ -142,11 +138,8 @@ def check_oxygen_link(html_content, anchor_text):
             break
     
     if target_node:
-        # 1. Direct Parent
         if target_node.parent.name == 'a' and target_node.parent.has_attr('href'):
             return target_node.parent['href'], "Found (Direct)"
-            
-        # 2. Walk Up (Link Wrappers)
         curr = target_node.parent
         steps = 0
         while curr and steps < 12:
@@ -154,7 +147,6 @@ def check_oxygen_link(html_content, anchor_text):
                 return curr['href'], "Found (Wrapper)"
             curr = curr.parent
             steps += 1
-            
         return None, "Text found, but no Link Wrapper detected."
     else:
         return None, "Anchor text not found on page."
@@ -162,7 +154,7 @@ def check_oxygen_link(html_content, anchor_text):
 def verify_with_gemini(anchor, instruction, link, creds, region, model_name):
     if not link: return "FAIL", "Link missing"
     try:
-        # Use the User-Selected Region and Model
+        # Initialize with User-Selected Region and Model
         vertexai.init(project=creds.project_id, location=region, credentials=creds)
         model = GenerativeModel(model_name)
         
@@ -209,10 +201,10 @@ with st.sidebar:
         staging_domain = st.text_input("New Domain", placeholder="e.g. wordpress-123.cloudwaysapps.com")
 
     st.divider()
-    # --- AI CONFIGURATION ---
     st.subheader("🤖 AI Config")
-    ai_region = st.selectbox("AI Region", ["us-central1", "us-west1", "us-east4", "us-east1"], index=0, help="If you get a 404 error, try changing this.")
-    ai_model = st.selectbox("AI Model", ["gemini-1.5-flash", "gemini-1.0-pro"], index=0, help="Flash is faster/cheaper. Pro is older/stable.")
+    # UPDATED MODELS BASED ON YOUR SCREENSHOT
+    ai_region = st.selectbox("AI Region", ["us-central1", "us-west1", "us-east4", "us-east1"], index=0)
+    ai_model = st.selectbox("AI Model", ["gemini-2.5-flash", "gemini-2.0-flash-001", "gemini-2.5-pro"], index=0)
 
     st.divider()
     st.caption("Filters")
@@ -323,7 +315,6 @@ with tab2:
                 
                 status_text.text(f"Scanning: {page_title}...")
                 
-                # PASSING IGNORED AUTHORS
                 comments = get_doc_comments(creds, doc_url, ignored_authors=ignored_authors)
                 
                 if isinstance(comments, str) and comments.startswith("Error"):
@@ -338,7 +329,6 @@ with tab2:
                             link_href, status_msg = check_oxygen_link(html_content, item['anchor'])
                             status, reason = "MISSING", status_msg
                             
-                            # Only ask AI if we actually found a link
                             if link_href:
                                 status, reason = verify_with_gemini(item['anchor'], item['instruction'], link_href, creds, ai_region, ai_model)
                             
