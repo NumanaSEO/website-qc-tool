@@ -128,7 +128,6 @@ def check_oxygen_link(html_content, anchor_text):
         for rubbish in soup.select('.ct-header, .ct-footer, header, footer, .oxy-nav-menu'): 
             rubbish.decompose()
 
-    # Fuzzy Match Logic
     clean_anchor = " ".join(anchor_text.split()).lower()
     all_text_nodes = search_scope.find_all(string=True)
     
@@ -155,7 +154,6 @@ def check_oxygen_link(html_content, anchor_text):
 def verify_with_gemini(anchor, instruction, link, creds, region, model_name):
     if not link: return "FAIL", "Link missing"
     try:
-        # Initialize with User-Selected Region and Model
         vertexai.init(project=creds.project_id, location=region, credentials=creds)
         model = GenerativeModel(model_name)
         
@@ -175,8 +173,18 @@ def verify_with_gemini(anchor, instruction, link, creds, region, model_name):
 
 # --- UTILS ---
 def normalize_text(text):
+    # 1. Normalize Unicode (fixes weird formatting chars)
     text = unicodedata.normalize("NFKD", text or "")
+    
+    # 2. Standardize Quotes (Smart vs Straight)
+    text = text.replace('“', '"').replace('”', '"').replace("‘", "'").replace("’", "'")
+    
+    # 3. Lowercase for case-insensitive comparison
+    text = text.lower()
+    
+    # 4. Collapse whitespace/newlines into single spaces
     text = re.sub(r'\s+', ' ', text).strip()
+    
     return text
 
 def create_diff(doc, web):
@@ -195,6 +203,10 @@ with st.sidebar:
         uploaded_key = st.file_uploader("Service Account JSON", type="json")
     
     st.divider()
+    st.subheader("🔧 QC Config")
+    # SENSITIVITY SLIDER
+    sensitivity = st.slider("Text Match Strictness %", 80, 100, 99, help="Higher = More sensitive to small changes.")
+    
     use_staging = st.checkbox("Override Domain (Optional)")
     staging_domain = ""
     if use_staging:
@@ -203,7 +215,6 @@ with st.sidebar:
 
     st.divider()
     st.subheader("🤖 AI Config")
-    # UPDATED MODELS BASED ON YOUR SCREENSHOT
     ai_region = st.selectbox("AI Region", ["us-central1", "us-west1", "us-east4", "us-east1"], index=0)
     ai_model = st.selectbox("AI Model", ["gemini-2.5-flash", "gemini-2.0-flash-001", "gemini-2.5-pro"], index=0)
 
@@ -242,10 +253,17 @@ with tab1:
                 status_text.text(f"Checking: {row.get('Page Title')}...")
                 doc_txt = get_doc_text(creds, doc_url)
                 web_txt = get_web_text_clean(url)
-                doc_norm, web_norm = normalize_text(doc_txt), normalize_text(web_txt)
+                
+                # NORMALIZE
+                doc_norm = normalize_text(doc_txt)
+                web_norm = normalize_text(web_txt)
+                
+                # COMPARE
                 seq = difflib.SequenceMatcher(None, doc_norm, web_norm)
                 sim = round(seq.ratio() * 100, 2)
-                status = "MATCH" if sim > 95 else "MISMATCH"
+                
+                # DYNAMIC STATUS BASED ON SLIDER
+                status = "MATCH" if sim >= sensitivity else "MISMATCH"
                 if "Error" in doc_txt or "Error" in web_txt: status = "ERROR"
                 
                 st.session_state['qc_results'].append({
