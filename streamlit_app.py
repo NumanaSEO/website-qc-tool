@@ -52,24 +52,51 @@ def get_creds(uploaded_key=None):
         )
     return None
 
-# --- TEXT EXTRACTORS ---
+# --- IMPROVED TEXT EXTRACTORS ---
+
+def read_structural_elements(elements):
+    """Recursively extracts text from Google Doc structures (Tables, Lists, Paragraphs)."""
+    text = ""
+    for value in elements:
+        # 1. Handle Paragraphs & Lists
+        if 'paragraph' in value:
+            elements = value.get('paragraph').get('elements')
+            for elem in elements:
+                content = elem.get('textRun', {}).get('content', '')
+                text += content
+        
+        # 2. Handle Tables (The Fix for Issue #1)
+        elif 'table' in value:
+            table = value.get('table')
+            for row in table.get('tableRows', []):
+                for cell in row.get('tableCells', []):
+                    # Recursive call to get content inside cell
+                    text += read_structural_elements(cell.get('content'))
+                    text += " " # Add space between cells so words don't merge
+                text += "\n" # Newline for rows
+        
+        # 3. Handle Section Breaks (optional, good for spacing)
+        elif 'sectionBreak' in value:
+            text += "\n"
+            
+    return text
+
 def get_doc_text(creds, doc_url):
     try:
         service = build("docs", "v1", credentials=creds)
         match = re.search(r'/d/([a-zA-Z0-9-_]+)', doc_url)
         if not match: return "Error: Invalid Doc URL"
         doc_id = match.group(1)
+        
         doc = service.documents().get(documentId=doc_id).execute()
-        text = ""
-        for value in doc.get('body').get('content'):
-            if 'paragraph' in value:
-                for elem in value.get('paragraph').get('elements'):
-                    text += elem.get('textRun', {}).get('content', '')
-        return text
+        # Use the new recursive function
+        raw_text = read_structural_elements(doc.get('body').get('content'))
+        return raw_text
     except Exception as e:
         return f"Error: {e}"
 
 def get_web_text_clean(url):
+    """Extracts text ONLY from 'page-content-area' if it exists."""
     try:
         headers = {'User-Agent': 'Mozilla/5.0 (QC-Bot)'}
         resp = requests.get(url, headers=headers, timeout=20)
@@ -79,20 +106,24 @@ def get_web_text_clean(url):
         for tag in soup(["script", "style", "noscript", "iframe", "svg"]): 
             tag.decompose()
         
+        # Try Developer Class first
         content_area = soup.find(class_="page-content-area")
+        
         if content_area:
-            text = content_area.get_text(separator='\n')
+            # Get text with separators to prevent words merging
+            text = content_area.get_text(separator=' ')
         else:
+            # Fallback cleaning
             oxy_junk = ["header", "footer", ".ct-header", ".ct-footer", ".oxy-header-container", ".oxy-nav-menu", ".ct-mobile-menu-icon", "#masthead", ".site-footer", ".screen-reader-text", ".visually-hidden", "#cookie-law-info-bar", ".moove-gdpr-cookie-compliance"]
             for selector in oxy_junk:
                 for tag in soup.select(selector): tag.decompose()
-            text = soup.get_text(separator='\n')
+            text = soup.get_text(separator=' ')
 
         return text.strip()
     except Exception as e:
         return f"Error: {e}"
 
-# --- LINK EXTRACTORS ---
+# --- IMPROVED LINK EXTRACTORS ---
 def get_doc_comments(creds, doc_url, ignored_authors=[]):
     try:
         match = re.search(r'/d/([a-zA-Z0-9-_]+)', doc_url)
@@ -121,44 +152,60 @@ def get_doc_comments(creds, doc_url, ignored_authors=[]):
 
 def check_oxygen_link(html_content, anchor_text):
     soup = BeautifulSoup(html_content, 'html.parser')
+    
+    # Define scope
     content_area = soup.find(class_="page-content-area")
     search_scope = content_area if content_area else soup
-
     if not content_area:
         for rubbish in soup.select('.ct-header, .ct-footer, header, footer, .oxy-nav-menu'): 
             rubbish.decompose()
 
+    # Normalize for search
     clean_anchor = " ".join(anchor_text.split()).lower()
-    all_text_nodes = search_scope.find_all(string=True)
     
-    target_node = None
-    for node in all_text_nodes:
-        if clean_anchor in " ".join(node.split()).lower():
-            target_node = node
-            break
+    # Find all text nodes containing the anchor text
+    # We use a regex to find the text even if it spans elements slightly
+    import re
+    # Escape regex characters in anchor text
+    safe_anchor = re.escape(clean_anchor)
+    # Allow for some whitespace variation in the regex
+    flexible_regex = safe_anchor.replace(r"\ ", r"\s+")
     
-    if target_node:
-        if target_node.parent.name == 'a' and target_node.parent.has_attr('href'):
-            return target_node.parent['href'], "Found (Direct)"
-        curr = target_node.parent
+    # Search the HTML string directly to find if it exists at all first
+    if clean_anchor not in " ".join(search_scope.get_text(separator=" ").lower().split()):
+         return None, "Text not found on page body."
+
+    # Now look for the link
+    # Find specific text node
+    target = search_scope.find(string=lambda t: t and clean_anchor in " ".join(t.split()).lower())
+    
+    if target:
+        # Check parents for <a>
+        curr = target.parent
         steps = 0
         while curr and steps < 12:
             if curr.name == 'a' and curr.has_attr('href'):
-                return curr['href'], "Found (Wrapper)"
+                # STRICT CHECK: Does the link cover the whole anchor?
+                link_text = " ".join(curr.get_text(separator=" ").split()).lower()
+                if clean_anchor in link_text:
+                    return curr['href'], "Found (Verified)"
+                else:
+                    return None, f"Text found, but link only covers part of it: '{link_text}'"
             curr = curr.parent
             steps += 1
-        return None, "Text found, but no Link Wrapper detected."
-    else:
-        return None, "Anchor text not found on page."
+            
+        return None, "Text found, but no Link tag detected."
+    
+    # Fallback: Deep Search
+    return None, "Text found in raw HTML but element could not be isolated."
 
 def verify_with_gemini(anchor, instruction, link, creds, region, model_name):
     if not link: return "FAIL", "Link missing"
     try:
         vertexai.init(project=creds.project_id, location=region, credentials=creds)
         model = GenerativeModel(model_name)
-        
         prompt = f"""
-        You are a QA Bot.
+        QA Task:
         Text: "{anchor}"
         Instruction: "{instruction}"
         Link found: "{link}"
@@ -173,62 +220,56 @@ def verify_with_gemini(anchor, instruction, link, creds, region, model_name):
 
 # --- UTILS ---
 def normalize_text(text):
-    # 1. Normalize Unicode (fixes weird formatting chars)
     text = unicodedata.normalize("NFKD", text or "")
     
-    # 2. Standardize Quotes (Smart vs Straight)
+    # 1. Clean Quotes
     text = text.replace('“', '"').replace('”', '"').replace("‘", "'").replace("’", "'")
     
-    # 3. Lowercase for case-insensitive comparison
-    text = text.lower()
+    # 2. Fix the "Space before Comma/Period" issue (Issue #2 Fix)
+    # Replaces "word , word" with "word, word"
+    text = re.sub(r'\s+([,.;:?!])', r'\1', text)
     
-    # 4. Collapse whitespace/newlines into single spaces
+    # 3. Collapse whitespace
     text = re.sub(r'\s+', ' ', text).strip()
     
-    return text
+    return text.lower()
 
 def create_diff(doc, web):
     d = difflib.HtmlDiff(wrapcolumn=80)
     return d.make_file(doc.splitlines(), web.splitlines(), fromdesc="Doc", todesc="Web")
 
 # --- UI START ---
-st.title("Content QC & Link Agent")
+st.title("Content QC & Link Agent (v2)")
 
 with st.sidebar:
     st.header("Settings")
     if "gcp_service_account" in st.secrets:
-        st.success("✅ Authenticated via Secrets")
+        st.success("✅ Authenticated")
         uploaded_key = None
     else:
         uploaded_key = st.file_uploader("Service Account JSON", type="json")
     
     st.divider()
     st.subheader("🔧 QC Config")
-    # SENSITIVITY SLIDER
-    sensitivity = st.slider("Text Match Strictness %", 80, 100, 99, help="Higher = More sensitive to small changes.")
+    sensitivity = st.slider("Strictness %", 80, 100, 95)
     
-    use_staging = st.checkbox("Override Domain (Optional)")
-    staging_domain = ""
-    if use_staging:
-        st.caption("Useful if CSV has Live URLs but testing Dev.")
-        staging_domain = st.text_input("New Domain", placeholder="e.g. wordpress-123.cloudwaysapps.com")
+    use_staging = st.checkbox("Override Domain")
+    staging_domain = st.text_input("New Domain") if use_staging else ""
 
     st.divider()
     st.subheader("🤖 AI Config")
-    ai_region = st.selectbox("AI Region", ["us-central1", "us-west1", "us-east4", "us-east1"], index=0)
-    ai_model = st.selectbox("AI Model", ["gemini-2.5-flash", "gemini-2.0-flash-001", "gemini-2.5-pro"], index=0)
+    ai_region = st.selectbox("Region", ["us-central1", "us-west1", "us-east1"], index=0)
+    ai_model = st.selectbox("Model", ["gemini-2.5-flash", "gemini-2.0-flash-001"], index=0)
 
     st.divider()
-    st.caption("Filters")
     ignored_input = st.text_input("Ignore Comments By:", placeholder="Name 1, Name 2")
     ignored_authors = [x.strip() for x in ignored_input.split(',')] if ignored_input else []
 
 creds = get_creds(uploaded_key)
 if not creds:
-    st.error("Please configure secrets.toml or upload a JSON key.")
+    st.error("Please configure secrets.")
     st.stop()
 
-# TABS
 tab1, tab2 = st.tabs(["📝 Text Comparison", "🔗 Link Auditor"])
 
 # --- TAB 1: TEXT QC ---
@@ -254,24 +295,17 @@ with tab1:
                 doc_txt = get_doc_text(creds, doc_url)
                 web_txt = get_web_text_clean(url)
                 
-                # NORMALIZE
                 doc_norm = normalize_text(doc_txt)
                 web_norm = normalize_text(web_txt)
                 
-                # COMPARE
                 seq = difflib.SequenceMatcher(None, doc_norm, web_norm)
                 sim = round(seq.ratio() * 100, 2)
                 
-                # DYNAMIC STATUS BASED ON SLIDER
                 status = "MATCH" if sim >= sensitivity else "MISMATCH"
                 if "Error" in doc_txt or "Error" in web_txt: status = "ERROR"
                 
                 st.session_state['qc_results'].append({
-                    "Title": row.get('Page Title'), 
-                    "Status": status, 
-                    "Score": sim,
-                    "Live URL": url,
-                    "Doc URL": doc_url,
+                    "Title": row.get('Page Title'), "Status": status, "Score": sim,
                     "Diff": create_diff(doc_norm, web_norm) if status == "MISMATCH" else None
                 })
                 bar.progress((i+1)/len(rows))
@@ -279,20 +313,14 @@ with tab1:
             
     if st.session_state['qc_results']:
         df = pd.DataFrame(st.session_state['qc_results'])
-        display_df = df[["Title", "Status", "Score"]]
-        def color_status(val):
-            return f'background-color: {"#d4edda" if val == "MATCH" else "#f8d7da" if val == "MISMATCH" else "#fff3cd"}'
-        st.dataframe(display_df.style.applymap(color_status, subset=['Status']), use_container_width=True)
-
-        col_d1, col_d2 = st.columns(2)
-        csv_full = df.drop(columns=['Diff'], errors='ignore').to_csv(index=False).encode('utf-8')
-        with col_d1: st.download_button("📥 Download Full Report", csv_full, "full_qc_report.csv", "text/csv")
+        st.dataframe(df[["Title", "Status", "Score"]].style.applymap(
+            lambda x: f'background-color: {"#d4edda" if x == "MATCH" else "#f8d7da" if x == "MISMATCH" else "#fff3cd"}', 
+            subset=['Status']
+        ), use_container_width=True)
         
-        mismatch_df = df[(df['Status'] == 'MISMATCH') | (df['Status'] == 'ERROR')].drop(columns=['Diff'], errors='ignore')
+        mismatch_df = df[(df['Status'] == 'MISMATCH') | (df['Status'] == 'ERROR')]
         if not mismatch_df.empty:
-            with col_d2: st.download_button("🚨 Download Fix Ticket", mismatch_df.to_csv(index=False).encode('utf-8'), "needed_fixes.csv", "text/csv", type="primary")
-        else:
-            with col_d2: st.success("No fixes needed! 🎉")
+            st.download_button("🚨 Download Fixes", mismatch_df.drop(columns=['Diff']).to_csv(index=False).encode('utf-8'), "qc_fixes.csv", "text/csv")
 
         sel = st.selectbox("Inspect Mismatch", df[df['Status']=="MISMATCH"]['Title'].unique())
         if sel:
@@ -333,7 +361,6 @@ with tab2:
                     live_url = f"https://{staging_domain}{path}"
                 
                 status_text.text(f"Scanning: {page_title}...")
-                
                 comments = get_doc_comments(creds, doc_url, ignored_authors=ignored_authors)
                 
                 if isinstance(comments, str) and comments.startswith("Error"):
@@ -369,6 +396,5 @@ with tab2:
                 res_df = pd.DataFrame(final_report)
                 cols = ["Page Title", "Status", "Anchor Text", "Instruction", "Found Link", "Reason"]
                 res_df = res_df[[c for c in cols if c in res_df.columns]]
-                def color_row(val): return f'background-color: {"#f8d7da" if val == "FAIL" else "#d4edda" if val == "PASS" else "white"}'
                 st.dataframe(res_df.style.applymap(lambda x: 'color:red;font-weight:bold' if x=='FAIL' else 'color:green;font-weight:bold' if x=='PASS' else 'color:orange', subset=['Status']), use_container_width=True)
                 st.download_button("📥 Download Link Report CSV", res_df.to_csv(index=False).encode('utf-8'), "link_audit_report.csv", "text/csv")
