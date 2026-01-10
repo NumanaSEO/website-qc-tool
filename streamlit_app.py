@@ -19,11 +19,15 @@ from urllib3.util.retry import Retry
 # ======================================================
 # STREAMLIT CONFIG
 # ======================================================
-st.set_page_config(
-    page_title="Content QC Agent",
-    page_icon="🧪",
-    layout="wide",
-)
+st.set_page_config(page_title="Content QC Agent", page_icon="🧪", layout="wide")
+
+# Persist results across reruns (dropdown changes, etc.)
+if "qc_df" not in st.session_state:
+    st.session_state.qc_df = None
+if "qc_problem_rows" not in st.session_state:
+    st.session_state.qc_problem_rows = None
+if "qc_ran" not in st.session_state:
+    st.session_state.qc_ran = False
 
 # ======================================================
 # REQUESTS SESSION (RETRIES)
@@ -83,7 +87,6 @@ def get_creds(uploaded_key=None):
             creds_info = None
 
     else:
-        # Local dev fallback
         for f in glob.glob("*.json"):
             if "service_account" in f:
                 try:
@@ -106,9 +109,9 @@ def get_creds(uploaded_key=None):
         ],
     )
 
-def creds_json_for_cache(uploaded_key=None) -> str | None:
+def creds_json_for_cache(uploaded_key=None):
     """
-    Used only for cache scoping (prevents cross-user cache bleed).
+    Used only for cache scoping; avoids cross-user cache bleed.
     """
     try:
         if "gcp_service_account" in st.secrets:
@@ -141,7 +144,6 @@ def read_doc_elements(elements):
                 row_cells = []
                 for cell in row.get("tableCells", []):
                     row_cells.append(read_doc_elements(cell.get("content", [])))
-                # Use a pipe delimiter so tables diff sanely
                 text += " | ".join([c.strip() for c in row_cells if c.strip()]) + "\n"
     return text
 
@@ -179,12 +181,11 @@ def get_doc_text(creds, doc_url: str) -> str:
 
 # ======================================================
 # WEB EXTRACTION (OXYGEN: REQUIRED .page-content-area)
-# Includes tables + accordion content if present in DOM
 # ======================================================
 def extract_structured_text(soup: BeautifulSoup, content_tag) -> str:
     """
-    Adds minimal separators so tables and block elements don't collapse into unreadable blobs.
-    Does NOT remove content.
+    Adds minimal separators for readability. Does NOT remove content.
+    Keeps tables + accordion text if present in DOM.
     """
     # Tables: delimit cells and rows
     for table in content_tag.find_all("table"):
@@ -193,7 +194,7 @@ def extract_structured_text(soup: BeautifulSoup, content_tag) -> str:
         for cell in table.find_all(["th", "td"]):
             cell.append(soup.new_string(" | "))
 
-    # Add newlines after common block-like elements for readability
+    # Add newlines after block-like elements (helps diff readability)
     block_tags = ["p", "li", "h1", "h2", "h3", "h4", "h5", "h6", "div", "section", "article"]
     for tag in content_tag.find_all(block_tags):
         tag.append(soup.new_string("\n"))
@@ -206,8 +207,7 @@ def extract_structured_text(soup: BeautifulSoup, content_tag) -> str:
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text
 
-@st.cache_data(show_spinner=False, ttl=3600)
-def get_web_text_cached(url: str) -> str:
+def fetch_web_text_uncached(url: str) -> str:
     headers = {"User-Agent": "QC-Bot/1.0"}
     resp = SESSION.get(url, headers=headers, timeout=25)
     if resp.status_code >= 400:
@@ -221,13 +221,16 @@ def get_web_text_cached(url: str) -> str:
 
     content = soup.find(class_="page-content-area")
     if not content:
-        # Per your requirement: this must exist. Hard fail.
         raise RuntimeError("Could not find required .page-content-area container")
 
     return extract_structured_text(soup, content)
 
+@st.cache_data(show_spinner=False, ttl=3600)
+def fetch_web_text_cached(url: str) -> str:
+    return fetch_web_text_uncached(url)
+
 def get_web_text(url: str, use_cache: bool) -> str:
-    return get_web_text_cached(url) if use_cache else get_web_text_cached.__wrapped__(url)
+    return fetch_web_text_cached(url) if use_cache else fetch_web_text_uncached(url)
 
 # ======================================================
 # QC NORMALIZATION + TOKEN DIFF (WORD + PUNCTUATION)
@@ -236,16 +239,15 @@ TOKEN_RE = re.compile(r"\w+|[^\w\s]", re.UNICODE)
 
 def qc_normalize(text: str, normalize_smart_punct: bool = True) -> str:
     """
-    Layout-insensitive, punctuation-sensitive normalization.
-    Collapses whitespace (because web layouts differ), keeps punctuation as tokens.
+    Layout-insensitive, punctuation-aware normalization.
+    Collapses whitespace (web layout differences) but keeps punctuation tokens.
     """
     t = text or ""
     t = unicodedata.normalize("NFKC", t)
     t = t.replace("\u200b", "").replace("\ufeff", "")  # zero-width/BOM
-    t = t.replace("\xa0", " ")  # NBSP -> normal space
+    t = t.replace("\xa0", " ")  # NBSP
 
     if normalize_smart_punct:
-        # If you want to *flag* curly quotes/dashes, set normalize_smart_punct=False in UI.
         t = (
             t.replace("“", '"').replace("”", '"')
              .replace("‘", "'").replace("’", "'")
@@ -253,12 +255,19 @@ def qc_normalize(text: str, normalize_smart_punct: bool = True) -> str:
              .replace("…", "...")
         )
 
-    # Collapse all whitespace to one space (removes layout differences)
     t = re.sub(r"\s+", " ", t).strip()
     return t
 
 def tokenize(text: str) -> list[str]:
     return TOKEN_RE.findall(text or "")
+
+def filter_tokens(tokens: list[str], ignore_pipes: bool = True) -> list[str]:
+    if not tokens:
+        return []
+    if not ignore_pipes:
+        return tokens
+    # Ignore the literal pipe token introduced for table readability
+    return [t for t in tokens if t != "|"]
 
 def token_match_rate(doc_tokens: list[str], web_tokens: list[str]) -> float:
     if not doc_tokens and not web_tokens:
@@ -309,6 +318,7 @@ with st.sidebar:
     st.markdown("### QC Settings")
     sensitivity = st.slider("Match Threshold (%)", 70, 100, 95)
     normalize_smart_punct = st.toggle("Ignore Smart Quotes/Dashes", value=True)
+    ignore_pipes = st.toggle("Ignore Table Pipes (|)", value=True)
     use_cache = st.toggle("Cache Fetches (Faster Re-Runs)", value=True)
 
 creds = get_creds(uploaded_key)
@@ -320,134 +330,148 @@ creds_cache_key = creds_json_for_cache(uploaded_key) if use_cache else None
 
 csv_file = st.file_uploader("Upload QC CSV", type="csv")
 
-if csv_file and st.button("Run QC"):
-    raw = csv_file.getvalue().decode("utf-8-sig")
-    rows = list(csv.DictReader(io.StringIO(raw)))
+# Run button (will trigger one rerun where button=True, then future reruns button=False)
+run_clicked = st.button("Run QC")
+
+if run_clicked:
+    raw = csv_file.getvalue().decode("utf-8-sig") if csv_file else ""
+    rows = list(csv.DictReader(io.StringIO(raw))) if raw else []
 
     if not rows:
-        st.warning("CSV appears empty.")
-        st.stop()
+        st.warning("Upload a CSV first (or CSV appears empty).")
+        st.session_state.qc_df = None
+        st.session_state.qc_problem_rows = None
+        st.session_state.qc_ran = False
+    else:
+        url_col = first_existing_col(rows, "URL", "Url", "url")
+        doc_col = first_existing_col(rows, "google_doc_url", "Google Doc URL", "Doc URL", "doc_url")
+        page_col = first_existing_col(rows, "Page Title", "Page", "Title", "page_title")
 
-    url_col = first_existing_col(rows, "URL", "Url", "url")
-    doc_col = first_existing_col(rows, "google_doc_url", "Google Doc URL", "Doc URL", "doc_url")
-    page_col = first_existing_col(rows, "Page Title", "Page", "Title", "page_title")
+        if not url_col or not doc_col:
+            st.error("CSV must include columns for URL and google_doc_url (header names can vary).")
+            st.session_state.qc_df = None
+            st.session_state.qc_problem_rows = None
+            st.session_state.qc_ran = False
+        else:
+            results = []
+            total = len(rows)
+            progress = st.progress(0)
 
-    if not url_col or not doc_col:
-        st.error("CSV must include columns for URL and google_doc_url (header names can vary).")
-        st.stop()
+            for i, r in enumerate(rows, start=1):
+                url = safe_str(r.get(url_col)).strip()
+                doc_url = safe_str(r.get(doc_col)).strip()
+                page_title = safe_str(r.get(page_col)).strip() if page_col else ""
 
-    results = []
-    total = len(rows)
-    progress = st.progress(0)
+                display_page = page_title or url or f"Row {i}"
 
-    for i, r in enumerate(rows, start=1):
-        url = safe_str(r.get(url_col)).strip()
-        doc_url = safe_str(r.get(doc_col)).strip()
-        page_title = safe_str(r.get(page_col)).strip() if page_col else ""
+                try:
+                    if not url:
+                        raise ValueError("Missing URL")
+                    if not doc_url:
+                        raise ValueError("Missing google_doc_url")
 
-        display_page = page_title or url or f"Row {i}"
+                    # Fetch texts
+                    if use_cache and creds_cache_key:
+                        doc_text = get_doc_text_cached(doc_url, creds_cache_key)
+                    else:
+                        doc_text = get_doc_text(creds, doc_url)
 
-        try:
-            if not url:
-                raise ValueError("Missing URL")
-            if not doc_url:
-                raise ValueError("Missing google_doc_url")
+                    web_text = get_web_text(url, use_cache=use_cache)
 
-            # Fetch texts
-            if use_cache and creds_cache_key:
-                doc_text = get_doc_text_cached(doc_url, creds_cache_key)
-            else:
-                doc_text = get_doc_text(creds, doc_url)
+                    # QC normalization
+                    doc_qc = qc_normalize(doc_text, normalize_smart_punct=normalize_smart_punct)
+                    web_qc = qc_normalize(web_text, normalize_smart_punct=normalize_smart_punct)
 
-            web_text = get_web_text(url, use_cache=use_cache)
+                    doc_tokens = filter_tokens(tokenize(doc_qc), ignore_pipes=ignore_pipes)
+                    web_tokens = filter_tokens(tokenize(web_qc), ignore_pipes=ignore_pipes)
 
-            # QC normalization (layout-insensitive)
-            doc_qc = qc_normalize(doc_text, normalize_smart_punct=normalize_smart_punct)
-            web_qc = qc_normalize(web_text, normalize_smart_punct=normalize_smart_punct)
+                    match_pct = token_match_rate(doc_tokens, web_tokens)
+                    stats = token_diff_stats(doc_tokens, web_tokens)
 
-            doc_tokens = tokenize(doc_qc)
-            web_tokens = tokenize(web_qc)
+                    warning = ""
+                    if len(doc_tokens) > 0 and len(web_tokens) < 0.5 * len(doc_tokens):
+                        warning = (
+                            f"Web text much shorter than doc "
+                            f"(web={len(web_tokens)} tokens, doc={len(doc_tokens)}). "
+                            "Possible missing DOM content (JS-injected accordion) or extraction issue."
+                        )
 
-            match_pct = token_match_rate(doc_tokens, web_tokens)
-            stats = token_diff_stats(doc_tokens, web_tokens)
+                    status = "MATCH" if match_pct >= sensitivity else "MISMATCH"
+                    diff_html = create_token_diff_html(doc_tokens, web_tokens) if status != "MATCH" else ""
 
-            # Warn when web appears “too short” (usually container missing content or JS-injected accordions)
-            warning = ""
-            if len(doc_tokens) > 0 and len(web_tokens) < 0.5 * len(doc_tokens):
-                warning = f"Web text much shorter than doc (web={len(web_tokens)} tokens, doc={len(doc_tokens)}). Possible missing DOM content."
+                    results.append(
+                        {
+                            "Page": display_page,
+                            "URL": url,
+                            "Doc URL": doc_url,
+                            "Status": status,
+                            "Match %": match_pct,
+                            "Replaced": stats["replace"],
+                            "Inserted": stats["insert"],
+                            "Deleted": stats["delete"],
+                            "Warning": warning,
+                            "Error": "",
+                            "Diff": diff_html,
+                        }
+                    )
 
-            status = "MATCH" if match_pct >= sensitivity else "MISMATCH"
+                except Exception as e:
+                    results.append(
+                        {
+                            "Page": display_page,
+                            "URL": url,
+                            "Doc URL": doc_url,
+                            "Status": "ERROR",
+                            "Match %": 0.0,
+                            "Replaced": 0,
+                            "Inserted": 0,
+                            "Deleted": 0,
+                            "Warning": "",
+                            "Error": repr(e),
+                            "Diff": "",
+                        }
+                    )
 
-            diff_html = create_token_diff_html(doc_tokens, web_tokens) if status != "MATCH" else ""
+                progress.progress(i / total)
 
-            results.append(
-                {
-                    "Page": display_page,
-                    "URL": url,
-                    "Doc URL": doc_url,
-                    "Status": status,
-                    "Match %": match_pct,
-                    "Replaced": stats["replace"],
-                    "Inserted": stats["insert"],
-                    "Deleted": stats["delete"],
-                    "Warning": warning,
-                    "Error": "",
-                    "Diff": diff_html,
-                }
-            )
+            df = pd.DataFrame(results)
+            st.session_state.qc_df = df
+            st.session_state.qc_problem_rows = df[df["Status"] != "MATCH"].reset_index(drop=True)
+            st.session_state.qc_ran = True
 
-        except Exception as e:
-            results.append(
-                {
-                    "Page": display_page,
-                    "URL": url,
-                    "Doc URL": doc_url,
-                    "Status": "ERROR",
-                    "Match %": 0.0,
-                    "Replaced": 0,
-                    "Inserted": 0,
-                    "Deleted": 0,
-                    "Warning": "",
-                    "Error": repr(e),
-                    "Diff": "",
-                }
-            )
-
-        progress.progress(i / total)
-
-    df = pd.DataFrame(results)
-
+# ======================================================
+# DISPLAY (renders on every rerun if results exist)
+# ======================================================
+if st.session_state.qc_df is not None:
+    df = st.session_state.qc_df
     st.dataframe(df.drop(columns=["Diff"]), width="stretch")
 
-    problem_rows = df[df["Status"] != "MATCH"].copy()
+    problem_rows = st.session_state.qc_problem_rows
 
-    if not problem_rows.empty:
+    if problem_rows is not None and not problem_rows.empty:
         st.download_button(
             "Download Review CSV",
             problem_rows.drop(columns=["Diff"]).to_csv(index=False).encode("utf-8"),
             "qc_review.csv",
         )
 
-        # Index-safe selection (no brittle Page == sel filtering)
-        pr = problem_rows.reset_index(drop=True)
-
-        labels = pr["Page"].fillna("").astype(str).str.strip()
-        labels = labels.where(labels != "", other=pr["URL"].fillna("").astype(str).str.strip())
-        labels = labels.where(labels != "", other=("Row " + (pr.index + 1).astype(str)))
+        labels = problem_rows["Page"].fillna("").astype(str).str.strip()
+        labels = labels.where(labels != "", other=problem_rows["URL"].fillna("").astype(str).str.strip())
+        labels = labels.where(labels != "", other=("Row " + (problem_rows.index + 1).astype(str)))
 
         sel_i = st.selectbox(
             "Inspect page",
-            options=list(pr.index),
-            format_func=lambda idx: f"{labels.iloc[idx]}  —  {pr.loc[idx, 'Status']}  —  {pr.loc[idx, 'Match %']}%",
+            options=list(problem_rows.index),
+            key="inspect_selectbox",  # persists selection across reruns
+            format_func=lambda idx: f"{labels.iloc[idx]} — {problem_rows.loc[idx, 'Status']} — {problem_rows.loc[idx, 'Match %']}%",
         )
 
-        err_msg = safe_str(pr.loc[sel_i, "Error"]).strip()
-        warn_msg = safe_str(pr.loc[sel_i, "Warning"]).strip()
-        diff_html = safe_str(pr.loc[sel_i, "Diff"])
+        err_msg = safe_str(problem_rows.loc[sel_i, "Error"]).strip()
+        warn_msg = safe_str(problem_rows.loc[sel_i, "Warning"]).strip()
+        diff_html = safe_str(problem_rows.loc[sel_i, "Diff"])
 
         if warn_msg:
             st.warning(warn_msg)
-
         if err_msg:
             st.error(err_msg)
 
@@ -457,3 +481,6 @@ if csv_file and st.button("Run QC"):
             st.info("No diff available for this row.")
     else:
         st.success("All rows are MATCH ✅")
+else:
+    # initial state / after reset
+    st.caption("Upload a CSV and click Run QC to generate results.")
