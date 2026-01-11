@@ -15,6 +15,7 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+from collections import Counter
 
 # ======================================================
 # STREAMLIT CONFIG
@@ -194,7 +195,7 @@ def extract_structured_text(soup: BeautifulSoup, content_tag) -> str:
         for cell in table.find_all(["th", "td"]):
             cell.append(soup.new_string(" | "))
 
-    # Add newlines after block-like elements (helps diff readability)
+    # Add newlines after block-like elements (helps readability; not used for scoring after whitespace collapse)
     block_tags = ["p", "li", "h1", "h2", "h3", "h4", "h5", "h6", "div", "section", "article"]
     for tag in content_tag.find_all(block_tags):
         tag.append(soup.new_string("\n"))
@@ -233,14 +234,14 @@ def get_web_text(url: str, use_cache: bool) -> str:
     return fetch_web_text_cached(url) if use_cache else fetch_web_text_uncached(url)
 
 # ======================================================
-# QC NORMALIZATION + TOKEN DIFF (WORD + PUNCTUATION)
+# QC NORMALIZATION + TOKENIZATION
 # ======================================================
 TOKEN_RE = re.compile(r"\w+|[^\w\s]", re.UNICODE)
 
 def qc_normalize(text: str, normalize_smart_punct: bool = True) -> str:
     """
     Layout-insensitive, punctuation-aware normalization.
-    Collapses whitespace (web layout differences) but keeps punctuation tokens.
+    Collapses whitespace but keeps punctuation tokens.
     """
     t = text or ""
     t = unicodedata.normalize("NFKC", t)
@@ -261,21 +262,105 @@ def qc_normalize(text: str, normalize_smart_punct: bool = True) -> str:
 def tokenize(text: str) -> list[str]:
     return TOKEN_RE.findall(text or "")
 
+# ======================================================
+# NOISE REMOVAL (PREVENT FORMAT/UI FALSE POSITIVES)
+# ======================================================
+NOISE_PATTERNS = [
+    r"^https?$",
+    r"^www$",
+    r"^https?://",
+    r"\.(jpg|jpeg|png|gif|webp|svg|mp4|mov|avi|m4v|pdf)$",
+    r"^wpdrpurl$",
+    r"^wp$",
+    r"^wordpress$",
+]
+
+# These are OPTIONAL; add/remove based on what your pages commonly inject.
+NOISE_PHRASES = [
+    "schedule an appointment",
+    "book an appointment",
+    "hear from",
+]
+
+STOP_TOKENS = {
+    ".", ",", ":", ";", "!", "?", "(", ")", "[", "]", "{", "}", '"', "'",
+}
+
+def remove_noise_phrases(text: str) -> str:
+    t = text or ""
+    tl = t.lower()
+    for p in NOISE_PHRASES:
+        tl = tl.replace(p, " ")
+    return tl
+
 def filter_tokens(tokens: list[str], ignore_pipes: bool = True) -> list[str]:
     if not tokens:
         return []
-    if not ignore_pipes:
-        return tokens
-    # Ignore the literal pipe token introduced for table readability
-    return [t for t in tokens if t != "|"]
 
-def token_match_rate(doc_tokens: list[str], web_tokens: list[str]) -> float:
+    out = []
+    for t in tokens:
+        tl = t.lower()
+
+        # Ignore the literal pipe token introduced for table readability
+        if ignore_pipes and t == "|":
+            continue
+
+        # Drop url-ish/media-ish tokens
+        if any(re.search(p, tl) for p in NOISE_PATTERNS):
+            continue
+
+        out.append(t)
+
+    return out
+
+# ======================================================
+# SCORING
+# ======================================================
+def token_sequence_similarity(doc_tokens: list[str], web_tokens: list[str]) -> float:
+    """
+    Sequence alignment score (order-sensitive). Useful for diagnostics,
+    but NOT a good single source of truth for web vs doc.
+    """
     if not doc_tokens and not web_tokens:
         return 100.0
     if not doc_tokens or not web_tokens:
         return 0.0
     sm = difflib.SequenceMatcher(a=doc_tokens, b=web_tokens, autojunk=False)
     return round(sm.ratio() * 100, 2)
+
+def doc_coverage_score(doc_tokens: list[str], web_tokens: list[str]) -> float:
+    """
+    Primary QC score: percent of DOC tokens found on WEB (counts matter).
+    Robust to formatting/reordering and repeated UI blocks.
+
+    Ignores pure punctuation tokens to reduce formatting noise.
+    """
+    if not doc_tokens and not web_tokens:
+        return 100.0
+    if not doc_tokens:
+        return 100.0
+    if not web_tokens:
+        return 0.0
+
+    d = [t.lower() for t in doc_tokens if t not in STOP_TOKENS]
+    w = [t.lower() for t in web_tokens if t not in STOP_TOKENS]
+
+    if not d and not w:
+        return 100.0
+    if not d:
+        return 100.0
+    if not w:
+        return 0.0
+
+    dc = Counter(d)
+    wc = Counter(w)
+
+    matched = 0
+    total = sum(dc.values())
+    for tok, cnt in dc.items():
+        matched += min(cnt, wc.get(tok, 0))
+
+    return round((matched / max(total, 1)) * 100, 2)
 
 def token_diff_stats(doc_tokens: list[str], web_tokens: list[str]) -> dict:
     sm = difflib.SequenceMatcher(a=doc_tokens, b=web_tokens, autojunk=False)
@@ -291,6 +376,9 @@ def token_diff_stats(doc_tokens: list[str], web_tokens: list[str]) -> dict:
             dele += (i2 - i1)
     return {"equal": eq, "replace": rep, "insert": ins, "delete": dele}
 
+# ======================================================
+# DIFF RENDERING (FOR HUMAN REVIEW)
+# ======================================================
 def tokens_to_lines(tokens: list[str], per_line: int = 14) -> list[str]:
     return [" ".join(tokens[i:i + per_line]) for i in range(0, len(tokens), per_line)]
 
@@ -316,10 +404,17 @@ with st.sidebar:
         uploaded_key = st.file_uploader("Service Account JSON", type="json")
 
     st.markdown("### QC Settings")
-    sensitivity = st.slider("Match Threshold (%)", 70, 100, 95)
+    sensitivity = st.slider("Coverage Threshold (%)", 70, 100, 98)
     normalize_smart_punct = st.toggle("Ignore Smart Quotes/Dashes", value=True)
     ignore_pipes = st.toggle("Ignore Table Pipes (|)", value=True)
+    strip_noise_phrases = st.toggle("Strip Common CTA Phrases", value=True)
     use_cache = st.toggle("Cache Fetches (Faster Re-Runs)", value=True)
+
+    st.markdown("### Notes")
+    st.caption(
+        "Coverage is the primary pass/fail (robust to formatting/reordering). "
+        "Sequence % is shown for diagnostics but not used to fail a page."
+    )
 
 creds = get_creds(uploaded_key)
 if not creds:
@@ -329,8 +424,6 @@ if not creds:
 creds_cache_key = creds_json_for_cache(uploaded_key) if use_cache else None
 
 csv_file = st.file_uploader("Upload QC CSV", type="csv")
-
-# Run button (will trigger one rerun where button=True, then future reruns button=False)
 run_clicked = st.button("Run QC")
 
 if run_clicked:
@@ -361,7 +454,6 @@ if run_clicked:
                 url = safe_str(r.get(url_col)).strip()
                 doc_url = safe_str(r.get(doc_col)).strip()
                 page_title = safe_str(r.get(page_col)).strip() if page_col else ""
-
                 display_page = page_title or url or f"Row {i}"
 
                 try:
@@ -382,21 +474,38 @@ if run_clicked:
                     doc_qc = qc_normalize(doc_text, normalize_smart_punct=normalize_smart_punct)
                     web_qc = qc_normalize(web_text, normalize_smart_punct=normalize_smart_punct)
 
+                    # Optional: strip common CTA phrases (helps reduce false mismatches)
+                    if strip_noise_phrases:
+                        doc_qc = remove_noise_phrases(doc_qc)
+                        web_qc = remove_noise_phrases(web_qc)
+
+                    # Tokenize + filter
                     doc_tokens = filter_tokens(tokenize(doc_qc), ignore_pipes=ignore_pipes)
                     web_tokens = filter_tokens(tokenize(web_qc), ignore_pipes=ignore_pipes)
 
-                    match_pct = token_match_rate(doc_tokens, web_tokens)
+                    # Primary score: coverage
+                    coverage_pct = doc_coverage_score(doc_tokens, web_tokens)
+
+                    # Secondary diagnostic: sequence
+                    seq_pct = token_sequence_similarity(doc_tokens, web_tokens)
+
                     stats = token_diff_stats(doc_tokens, web_tokens)
 
                     warning = ""
                     if len(doc_tokens) > 0 and len(web_tokens) < 0.5 * len(doc_tokens):
                         warning = (
-                            f"Web text much shorter than doc "
-                            f"(web={len(web_tokens)} tokens, doc={len(doc_tokens)}). "
+                            f"Web text much shorter than doc (web={len(web_tokens)} tokens, doc={len(doc_tokens)}). "
                             "Possible missing DOM content (JS-injected accordion) or extraction issue."
                         )
+                    elif coverage_pct >= sensitivity and seq_pct < sensitivity:
+                        warning = (
+                            "High coverage but low sequence alignment. Likely formatting/reordering/UI block differences "
+                            "(content probably copied correctly)."
+                        )
 
-                    status = "MATCH" if match_pct >= sensitivity else "MISMATCH"
+                    status = "MATCH" if coverage_pct >= sensitivity else "MISMATCH"
+
+                    # Only generate diff when coverage fails (otherwise diff can be misleading)
                     diff_html = create_token_diff_html(doc_tokens, web_tokens) if status != "MATCH" else ""
 
                     results.append(
@@ -405,7 +514,8 @@ if run_clicked:
                             "URL": url,
                             "Doc URL": doc_url,
                             "Status": status,
-                            "Match %": match_pct,
+                            "Coverage %": coverage_pct,
+                            "Sequence %": seq_pct,
                             "Replaced": stats["replace"],
                             "Inserted": stats["insert"],
                             "Deleted": stats["delete"],
@@ -422,7 +532,8 @@ if run_clicked:
                             "URL": url,
                             "Doc URL": doc_url,
                             "Status": "ERROR",
-                            "Match %": 0.0,
+                            "Coverage %": 0.0,
+                            "Sequence %": 0.0,
                             "Replaced": 0,
                             "Inserted": 0,
                             "Deleted": 0,
@@ -462,25 +573,12 @@ if st.session_state.qc_df is not None:
         sel_i = st.selectbox(
             "Inspect page",
             options=list(problem_rows.index),
-            key="inspect_selectbox",  # persists selection across reruns
-            format_func=lambda idx: f"{labels.iloc[idx]} — {problem_rows.loc[idx, 'Status']} — {problem_rows.loc[idx, 'Match %']}%",
+            key="inspect_selectbox",
+            format_func=lambda idx: (
+                f"{labels.iloc[idx]} — {problem_rows.loc[idx, 'Status']} — "
+                f"Coverage {problem_rows.loc[idx, 'Coverage %']}% / Seq {problem_rows.loc[idx, 'Sequence %']}%"
+            ),
         )
 
         err_msg = safe_str(problem_rows.loc[sel_i, "Error"]).strip()
-        warn_msg = safe_str(problem_rows.loc[sel_i, "Warning"]).strip()
-        diff_html = safe_str(problem_rows.loc[sel_i, "Diff"])
-
-        if warn_msg:
-            st.warning(warn_msg)
-        if err_msg:
-            st.error(err_msg)
-
-        if diff_html.strip():
-            components.html(diff_html, height=650, scrolling=True)
-        else:
-            st.info("No diff available for this row.")
-    else:
-        st.success("All rows are MATCH ✅")
-else:
-    # initial state / after reset
-    st.caption("Upload a CSV and click Run QC to generate results.")
+        warn_msg =_
