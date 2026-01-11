@@ -27,8 +27,6 @@ if "qc_df" not in st.session_state:
     st.session_state.qc_df = None
 if "qc_problem_rows" not in st.session_state:
     st.session_state.qc_problem_rows = None
-if "qc_ran" not in st.session_state:
-    st.session_state.qc_ran = False
 
 # ======================================================
 # REQUESTS SESSION (RETRIES)
@@ -195,7 +193,7 @@ def extract_structured_text(soup: BeautifulSoup, content_tag) -> str:
         for cell in table.find_all(["th", "td"]):
             cell.append(soup.new_string(" | "))
 
-    # Add newlines after block-like elements (helps readability; not used for scoring after whitespace collapse)
+    # Add newlines after block-like elements (helps readability)
     block_tags = ["p", "li", "h1", "h2", "h3", "h4", "h5", "h6", "div", "section", "article"]
     for tag in content_tag.find_all(block_tags):
         tag.append(soup.new_string("\n"))
@@ -263,7 +261,7 @@ def tokenize(text: str) -> list[str]:
     return TOKEN_RE.findall(text or "")
 
 # ======================================================
-# NOISE REMOVAL (PREVENT FORMAT/UI FALSE POSITIVES)
+# NOISE REMOVAL (PREVENT UI/FORMAT FALSE POSITIVES)
 # ======================================================
 NOISE_PATTERNS = [
     r"^https?$",
@@ -275,7 +273,6 @@ NOISE_PATTERNS = [
     r"^wordpress$",
 ]
 
-# These are OPTIONAL; add/remove based on what your pages commonly inject.
 NOISE_PHRASES = [
     "schedule an appointment",
     "book an appointment",
@@ -286,17 +283,18 @@ STOP_TOKENS = {
     ".", ",", ":", ";", "!", "?", "(", ")", "[", "]", "{", "}", '"', "'",
 }
 
-def remove_noise_phrases(text: str) -> str:
+def strip_phrases_case_insensitive(text: str, phrases: list[str]) -> str:
     t = text or ""
-    tl = t.lower()
-    for p in NOISE_PHRASES:
-        tl = tl.replace(p, " ")
-    return tl
+    for p in phrases:
+        if not p:
+            continue
+        t = re.sub(re.escape(p), " ", t, flags=re.IGNORECASE)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
 
 def filter_tokens(tokens: list[str], ignore_pipes: bool = True) -> list[str]:
     if not tokens:
         return []
-
     out = []
     for t in tokens:
         tl = t.lower()
@@ -305,22 +303,16 @@ def filter_tokens(tokens: list[str], ignore_pipes: bool = True) -> list[str]:
         if ignore_pipes and t == "|":
             continue
 
-        # Drop url-ish/media-ish tokens
         if any(re.search(p, tl) for p in NOISE_PATTERNS):
             continue
 
         out.append(t)
-
     return out
 
 # ======================================================
 # SCORING
 # ======================================================
 def token_sequence_similarity(doc_tokens: list[str], web_tokens: list[str]) -> float:
-    """
-    Sequence alignment score (order-sensitive). Useful for diagnostics,
-    but NOT a good single source of truth for web vs doc.
-    """
     if not doc_tokens and not web_tokens:
         return 100.0
     if not doc_tokens or not web_tokens:
@@ -331,8 +323,6 @@ def token_sequence_similarity(doc_tokens: list[str], web_tokens: list[str]) -> f
 def doc_coverage_score(doc_tokens: list[str], web_tokens: list[str]) -> float:
     """
     Primary QC score: percent of DOC tokens found on WEB (counts matter).
-    Robust to formatting/reordering and repeated UI blocks.
-
     Ignores pure punctuation tokens to reduce formatting noise.
     """
     if not doc_tokens and not web_tokens:
@@ -410,11 +400,7 @@ with st.sidebar:
     strip_noise_phrases = st.toggle("Strip Common CTA Phrases", value=True)
     use_cache = st.toggle("Cache Fetches (Faster Re-Runs)", value=True)
 
-    st.markdown("### Notes")
-    st.caption(
-        "Coverage is the primary pass/fail (robust to formatting/reordering). "
-        "Sequence % is shown for diagnostics but not used to fail a page."
-    )
+    st.caption("Coverage is the pass/fail (formatting/order-robust). Sequence % is diagnostic only.")
 
 creds = get_creds(uploaded_key)
 if not creds:
@@ -434,7 +420,6 @@ if run_clicked:
         st.warning("Upload a CSV first (or CSV appears empty).")
         st.session_state.qc_df = None
         st.session_state.qc_problem_rows = None
-        st.session_state.qc_ran = False
     else:
         url_col = first_existing_col(rows, "URL", "Url", "url")
         doc_col = first_existing_col(rows, "google_doc_url", "Google Doc URL", "Doc URL", "doc_url")
@@ -444,7 +429,6 @@ if run_clicked:
             st.error("CSV must include columns for URL and google_doc_url (header names can vary).")
             st.session_state.qc_df = None
             st.session_state.qc_problem_rows = None
-            st.session_state.qc_ran = False
         else:
             results = []
             total = len(rows)
@@ -470,23 +454,21 @@ if run_clicked:
 
                     web_text = get_web_text(url, use_cache=use_cache)
 
-                    # QC normalization
+                    # Normalize
                     doc_qc = qc_normalize(doc_text, normalize_smart_punct=normalize_smart_punct)
                     web_qc = qc_normalize(web_text, normalize_smart_punct=normalize_smart_punct)
 
-                    # Optional: strip common CTA phrases (helps reduce false mismatches)
+                    # Optional: strip common CTA phrases (case-insensitive, without destroying case)
                     if strip_noise_phrases:
-                        doc_qc = remove_noise_phrases(doc_qc)
-                        web_qc = remove_noise_phrases(web_qc)
+                        doc_qc = strip_phrases_case_insensitive(doc_qc, NOISE_PHRASES)
+                        web_qc = strip_phrases_case_insensitive(web_qc, NOISE_PHRASES)
 
                     # Tokenize + filter
                     doc_tokens = filter_tokens(tokenize(doc_qc), ignore_pipes=ignore_pipes)
                     web_tokens = filter_tokens(tokenize(web_qc), ignore_pipes=ignore_pipes)
 
-                    # Primary score: coverage
+                    # Scores
                     coverage_pct = doc_coverage_score(doc_tokens, web_tokens)
-
-                    # Secondary diagnostic: sequence
                     seq_pct = token_sequence_similarity(doc_tokens, web_tokens)
 
                     stats = token_diff_stats(doc_tokens, web_tokens)
@@ -505,7 +487,7 @@ if run_clicked:
 
                     status = "MATCH" if coverage_pct >= sensitivity else "MISMATCH"
 
-                    # Only generate diff when coverage fails (otherwise diff can be misleading)
+                    # Only generate diff when Coverage fails (diff can be misleading otherwise)
                     diff_html = create_token_diff_html(doc_tokens, web_tokens) if status != "MATCH" else ""
 
                     results.append(
@@ -548,10 +530,9 @@ if run_clicked:
             df = pd.DataFrame(results)
             st.session_state.qc_df = df
             st.session_state.qc_problem_rows = df[df["Status"] != "MATCH"].reset_index(drop=True)
-            st.session_state.qc_ran = True
 
 # ======================================================
-# DISPLAY (renders on every rerun if results exist)
+# DISPLAY
 # ======================================================
 if st.session_state.qc_df is not None:
     df = st.session_state.qc_df
@@ -580,5 +561,24 @@ if st.session_state.qc_df is not None:
             ),
         )
 
+        # ✅ FIX: no stray "_" assignment; always pull from the row safely
+        warn_msg = safe_str(problem_rows.loc[sel_i, "Warning"]).strip()
         err_msg = safe_str(problem_rows.loc[sel_i, "Error"]).strip()
-        warn_msg =_
+        diff_html = safe_str(problem_rows.loc[sel_i, "Diff"])
+
+        if warn_msg:
+            st.warning(warn_msg)
+        if err_msg:
+            st.error(err_msg)
+
+        if diff_html.strip():
+            components.html(diff_html, height=650, scrolling=True)
+        else:
+            st.info(
+                "No diff shown for this row. "
+                "Diffs are only generated when Coverage fails (to avoid misleading formatting-order diffs)."
+            )
+    else:
+        st.success("All rows are MATCH ✅")
+else:
+    st.caption("Upload a CSV and click Run QC to generate results.")
