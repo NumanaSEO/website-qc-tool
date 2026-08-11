@@ -1,37 +1,105 @@
-import streamlit as st
-import streamlit.components.v1 as components
+"""
+Content QC Agent — Numana Digital
+=================================
+
+Compares approved copy in a Google Doc against the words published on a live page.
+
+Scope: words only. Structural/SEO checks (title, meta, H1, alt text, links) are
+deliberately excluded — those belong to the SEO QC pass that runs separately.
+
+Output is a punch list, not a similarity score:
+    MISSING  — text in the doc that is not on the page
+    ALTERED  — text on the page that was changed from the doc
+    EXTRA    — text on the page that is not in the doc
+    MOVED    — text present in both but in a different position
+
+Extraction contract: page content MUST be inside `.page-content-area`.
+A page without it is reported as a DEV DEFECT, not a content mismatch.
+
+Auth: service account, configured in Streamlit secrets only. The content team
+never handles credentials.
+"""
+
+from __future__ import annotations
+
+import csv
+import difflib
+import io
+import json
+import re
+import unicodedata
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
+from typing import Optional
+
 import pandas as pd
 import requests
-import re
-import difflib
-import unicodedata
-import io
-import csv
-import glob
-import json
+import streamlit as st
 from bs4 import BeautifulSoup
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-from collections import Counter
 
-# ======================================================
-# STREAMLIT CONFIG
-# ======================================================
-st.set_page_config(page_title="Content QC Agent", page_icon="🧪", layout="wide")
+# ======================================================================
+# CONFIG
+# ======================================================================
 
-# Persist results across reruns (dropdown changes, etc.)
-if "qc_df" not in st.session_state:
-    st.session_state.qc_df = None
-if "qc_problem_rows" not in st.session_state:
-    st.session_state.qc_problem_rows = None
+CONTENT_SELECTOR = ".page-content-area"
 
-# ======================================================
-# REQUESTS SESSION (RETRIES)
-# ======================================================
-def build_requests_session() -> requests.Session:
+# Extraction tiers. Tier 0 is the contract with the dev team. Anything below it
+# still produces a usable QC pass, but the page is reported as a build defect.
+FALLBACK_SELECTORS = [
+    "main",
+    "article",
+    ".entry-content",
+    ".site-content",
+    "#content",
+]
+
+# Chrome to strip when running on a fallback selector, where the container is
+# not guaranteed to exclude template furniture.
+CHROME_SELECTOR = (
+    'nav, footer, header, aside, form, '
+    '[role="dialog"], [role="navigation"], [role="banner"], [role="contentinfo"], '
+    '[aria-hidden="true"], .menu, .navbar, .breadcrumb, '
+    '[class*="cookie"], [id*="cookie"], [class*="gdpr"], [id*="gdpr"], '
+    '[class*="modal"], [class*="popup"], [class*="offcanvas"]'
+)
+
+# A fallback extraction yielding less than this is treated as a failed read
+# rather than a page whose content is genuinely missing.
+MIN_FALLBACK_CHARS = 400
+
+SCOPES = [
+    "https://www.googleapis.com/auth/documents.readonly",
+    "https://www.googleapis.com/auth/drive.readonly",
+]
+
+BLOCK_TAGS = ["h1", "h2", "h3", "h4", "h5", "h6", "p", "li", "blockquote"]
+HEADING_TAGS = {"h1", "h2", "h3", "h4", "h5", "h6"}
+
+# Stripped from BOTH sides before comparison. These are template-injected
+# strings that appear on the page but never in the copy doc.
+NOISE_PHRASES = [
+    "schedule an appointment",
+    "book an appointment",
+    "online bill pay",
+]
+
+# Blocks shorter than this are ignored entirely (stray characters, icons).
+MIN_BLOCK_CHARS = 3
+
+st.set_page_config(page_title="Content QC", page_icon="🧪", layout="wide")
+
+
+# ======================================================================
+# HTTP SESSION
+# ======================================================================
+
+def _build_session() -> requests.Session:
     s = requests.Session()
     retries = Retry(
         total=3,
@@ -40,545 +108,635 @@ def build_requests_session() -> requests.Session:
         allowed_methods=("GET",),
         raise_on_status=False,
     )
-    adapter = HTTPAdapter(max_retries=retries)
+    adapter = HTTPAdapter(max_retries=retries, pool_maxsize=16)
     s.mount("http://", adapter)
     s.mount("https://", adapter)
     return s
 
-SESSION = build_requests_session()
 
-# ======================================================
-# SMALL UTILS
-# ======================================================
-def safe_str(x) -> str:
-    if x is None:
-        return ""
-    if isinstance(x, float) and pd.isna(x):
-        return ""
-    return str(x)
+SESSION = _build_session()
 
-def first_existing_col(rows, *candidates):
-    if not rows:
+
+# ======================================================================
+# ERRORS — every message must tell the content team what to do next
+# ======================================================================
+
+class QCError(Exception):
+    """Base for errors surfaced to the content team in plain language."""
+
+    kind = "error"
+
+
+class ContainerMissing(QCError):
+    kind = "dev_defect"
+
+    def __init__(self, url: str):
+        super().__init__(
+            f"Page is missing the {CONTENT_SELECTOR} container and no readable content "
+            "block could be found either. This is a build issue, not a content issue — "
+            "send this URL to the dev team."
+        )
+        self.url = url
+
+
+class PageUnreadable(QCError):
+    pass
+
+
+class DocUnreadable(QCError):
+    pass
+
+
+# ======================================================================
+# AUTH — secrets only
+# ======================================================================
+
+def get_credentials() -> Optional[service_account.Credentials]:
+    if "gcp_service_account" not in st.secrets:
         return None
-    headers = set(rows[0].keys())
-    for c in candidates:
-        if c in headers:
-            return c
-    return None
+    info = dict(st.secrets["gcp_service_account"])
+    pk = info.get("private_key")
+    if isinstance(pk, str):
+        info["private_key"] = pk.replace("\\n", "\n")
+    return service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
 
-# ======================================================
-# AUTH
-# ======================================================
-def get_creds(uploaded_key=None):
-    creds_info = None
 
-    if "gcp_service_account" in st.secrets:
-        creds_info = dict(st.secrets["gcp_service_account"])
-        if "private_key" in creds_info and isinstance(creds_info["private_key"], str):
-            creds_info["private_key"] = creds_info["private_key"].replace("\\n", "\n")
+def _docs_service():
+    """New service per call — googleapiclient http objects are not thread-safe."""
+    return build("docs", "v1", credentials=get_credentials(), cache_discovery=False)
 
-    elif uploaded_key is not None:
-        try:
-            creds_info = json.loads(uploaded_key.getvalue().decode("utf-8"))
-            if "private_key" in creds_info and isinstance(creds_info["private_key"], str):
-                creds_info["private_key"] = creds_info["private_key"].replace("\\n", "\n")
-        except Exception:
-            creds_info = None
 
-    else:
-        for f in glob.glob("*.json"):
-            if "service_account" in f:
-                try:
-                    with open(f, "r", encoding="utf-8") as fh:
-                        creds_info = json.load(fh)
-                    if "private_key" in creds_info and isinstance(creds_info["private_key"], str):
-                        creds_info["private_key"] = creds_info["private_key"].replace("\\n", "\n")
-                    break
-                except Exception:
-                    pass
+# ======================================================================
+# BLOCK MODEL
+# ======================================================================
 
-    if not creds_info:
-        return None
+@dataclass
+class Block:
+    text: str
+    norm: str
+    kind: str          # heading | paragraph | list_item | quote
+    level: int = 0     # heading depth, 0 for non-headings
+    section: str = ""  # nearest preceding heading
 
-    return service_account.Credentials.from_service_account_info(
-        creds_info,
-        scopes=[
-            "https://www.googleapis.com/auth/documents.readonly",
-            "https://www.googleapis.com/auth/drive.readonly",
-        ],
-    )
 
-def creds_json_for_cache(uploaded_key=None):
-    """
-    Used only for cache scoping; avoids cross-user cache bleed.
-    """
-    try:
-        if "gcp_service_account" in st.secrets:
-            cj = dict(st.secrets["gcp_service_account"])
-            if "private_key" in cj and isinstance(cj["private_key"], str):
-                cj["private_key"] = cj["private_key"].replace("\\n", "\n")
-            return json.dumps(cj, sort_keys=True)
+def qc_normalize(text: str, smart_punct: bool = True) -> str:
+    t = unicodedata.normalize("NFKC", text or "")
+    t = t.replace("\u200b", "").replace("\ufeff", "").replace("\xa0", " ")
+    if smart_punct:
+        for a, b in (
+            ("\u201c", '"'), ("\u201d", '"'),
+            ("\u2018", "'"), ("\u2019", "'"),
+            ("\u2014", "-"), ("\u2013", "-"),
+            ("\u2026", "..."),
+        ):
+            t = t.replace(a, b)
+    return re.sub(r"\s+", " ", t).strip()
 
-        if uploaded_key is not None:
-            cj = json.loads(uploaded_key.getvalue().decode("utf-8"))
-            if "private_key" in cj and isinstance(cj["private_key"], str):
-                cj["private_key"] = cj["private_key"].replace("\\n", "\n")
-            return json.dumps(cj, sort_keys=True)
-    except Exception:
-        return None
 
-    return None
+def strip_noise(text: str, phrases: list[str]) -> str:
+    t = text or ""
+    for p in phrases:
+        t = re.sub(re.escape(p), " ", t, flags=re.IGNORECASE)
+    return re.sub(r"\s+", " ", t).strip()
 
-# ======================================================
-# GOOGLE DOC EXTRACTION (STRUCTURE SAFE, TABLE SAFE)
-# ======================================================
-def read_doc_elements(elements):
-    text = ""
-    for e in elements or []:
-        if "paragraph" in e:
-            for pe in e["paragraph"].get("elements", []):
-                text += pe.get("textRun", {}).get("content", "")
-        elif "table" in e:
-            for row in e["table"].get("tableRows", []):
-                row_cells = []
+
+def finalize_blocks(raw: list[tuple[str, str, int]], smart_punct: bool,
+                    strip_ctas: bool) -> list[Block]:
+    """raw: list of (text, kind, level). Attaches section context, drops noise."""
+    blocks: list[Block] = []
+    current_section = ""
+    for text, kind, level in raw:
+        clean = text.strip()
+        if strip_ctas:
+            clean = strip_noise(clean, NOISE_PHRASES)
+        norm = qc_normalize(clean, smart_punct)
+        if len(norm) < MIN_BLOCK_CHARS:
+            continue
+        if not re.search(r"\w", norm):
+            continue
+        if kind == "heading":
+            current_section = clean
+            blocks.append(Block(clean, norm, kind, level, current_section))
+        else:
+            blocks.append(Block(clean, norm, kind, level, current_section))
+    return blocks
+
+
+# ======================================================================
+# GOOGLE DOC → BLOCKS
+# ======================================================================
+
+def _doc_id(url: str) -> str:
+    m = re.search(r"/d/([a-zA-Z0-9\-_]+)", url or "")
+    if not m:
+        raise DocUnreadable(
+            "That doesn't look like a Google Doc link. Check the doc column in your CSV."
+        )
+    return m.group(1)
+
+
+def _walk_doc_elements(elements) -> list[tuple[str, str, int]]:
+    out: list[tuple[str, str, int]] = []
+    for el in elements or []:
+        if "paragraph" in el:
+            para = el["paragraph"]
+            text = "".join(
+                pe.get("textRun", {}).get("content", "")
+                for pe in para.get("elements", [])
+            )
+            if not text.strip():
+                continue
+            style = para.get("paragraphStyle", {}).get("namedStyleType", "NORMAL_TEXT")
+            if style.startswith("HEADING_"):
+                out.append((text, "heading", int(style.split("_")[1])))
+            elif style in ("TITLE", "SUBTITLE"):
+                out.append((text, "heading", 1))
+            elif "bullet" in para:
+                out.append((text, "list_item", 0))
+            else:
+                out.append((text, "paragraph", 0))
+        elif "table" in el:
+            for row in el["table"].get("tableRows", []):
                 for cell in row.get("tableCells", []):
-                    row_cells.append(read_doc_elements(cell.get("content", [])))
-                text += " | ".join([c.strip() for c in row_cells if c.strip()]) + "\n"
-    return text
+                    out.extend(_walk_doc_elements(cell.get("content", [])))
+    return out
+
 
 @st.cache_data(show_spinner=False, ttl=3600)
-def get_doc_text_cached(doc_url: str, creds_json: str) -> str:
-    creds_info = json.loads(creds_json)
-    creds = service_account.Credentials.from_service_account_info(
-        creds_info,
-        scopes=[
-            "https://www.googleapis.com/auth/documents.readonly",
-            "https://www.googleapis.com/auth/drive.readonly",
-        ],
-    )
-    service = build("docs", "v1", credentials=creds, cache_discovery=False)
-
-    match = re.search(r"/d/([a-zA-Z0-9-_]+)", doc_url or "")
-    if not match:
-        return ""
-    doc_id = match.group(1)
-
+def fetch_doc_raw(doc_url: str) -> list[tuple[str, str, int]]:
+    """Cached on doc URL only — credentials never enter the cache key."""
+    doc_id = _doc_id(doc_url)
     try:
-        doc = service.documents().get(documentId=doc_id).execute()
-        return read_doc_elements(doc.get("body", {}).get("content", []))
+        doc = _docs_service().documents().get(documentId=doc_id).execute()
     except HttpError as e:
-        raise RuntimeError(f"Google Docs API error: {e}") from e
+        status = getattr(e.resp, "status", None)
+        if status in (403, 404):
+            raise DocUnreadable(
+                "The QC tool can't open this doc. It needs to be in the shared "
+                "content drive — send the link to Jen."
+            ) from e
+        raise DocUnreadable(f"Google Docs couldn't return this file (error {status}).") from e
+    return _walk_doc_elements(doc.get("body", {}).get("content", []))
 
-def get_doc_text(creds, doc_url: str) -> str:
-    service = build("docs", "v1", credentials=creds, cache_discovery=False)
-    match = re.search(r"/d/([a-zA-Z0-9-_]+)", doc_url or "")
-    if not match:
-        return ""
-    doc_id = match.group(1)
-    doc = service.documents().get(documentId=doc_id).execute()
-    return read_doc_elements(doc.get("body", {}).get("content", []))
 
-# ======================================================
-# WEB EXTRACTION (OXYGEN: REQUIRED .page-content-area)
-# ======================================================
-def extract_structured_text(soup: BeautifulSoup, content_tag) -> str:
-    """
-    Adds minimal separators for readability. Does NOT remove content.
-    Keeps tables + accordion text if present in DOM.
-    """
-    # Tables: delimit cells and rows
-    for table in content_tag.find_all("table"):
-        for tr in table.find_all("tr"):
-            tr.append(soup.new_string("\n"))
-        for cell in table.find_all(["th", "td"]):
-            cell.append(soup.new_string(" | "))
+# ======================================================================
+# WEB PAGE → BLOCKS
+# ======================================================================
 
-    # Add newlines after block-like elements (helps readability)
-    block_tags = ["p", "li", "h1", "h2", "h3", "h4", "h5", "h6", "div", "section", "article"]
-    for tag in content_tag.find_all(block_tags):
-        tag.append(soup.new_string("\n"))
+@st.cache_data(show_spinner=False, ttl=3600)
+def fetch_page_raw(url: str) -> tuple[list[tuple[str, str, int]], str]:
+    try:
+        resp = SESSION.get(url, headers={"User-Agent": "Numana-QC/2.0"}, timeout=30)
+    except requests.RequestException as e:
+        raise PageUnreadable(
+            "Couldn't reach this page. Check the URL, or the staging site may be down."
+        ) from e
 
-    for br in content_tag.find_all("br"):
-        br.replace_with("\n")
-
-    text = content_tag.get_text(separator=" ", strip=False)
-    text = text.replace("\r\n", "\n").replace("\r", "\n")
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    return text
-
-def fetch_web_text_uncached(url: str) -> str:
-    headers = {"User-Agent": "QC-Bot/1.0"}
-    resp = SESSION.get(url, headers=headers, timeout=25)
+    if resp.status_code == 404:
+        raise PageUnreadable("Page not found (404). Check the URL in your CSV.")
+    if resp.status_code in (401, 403):
+        raise PageUnreadable(
+            "This page is password-protected. The QC tool can't read it."
+        )
     if resp.status_code >= 400:
-        raise RuntimeError(f"HTTP {resp.status_code} fetching {url}")
+        raise PageUnreadable(f"The site returned an error ({resp.status_code}) for this page.")
 
     soup = BeautifulSoup(resp.text, "html.parser")
-
-    # remove things that are never content
     for tag in soup(["script", "style", "noscript", "iframe", "svg"]):
         tag.decompose()
 
-    content = soup.find(class_="page-content-area")
-    if not content:
-        raise RuntimeError("Could not find required .page-content-area container")
+    container = soup.select_one(CONTENT_SELECTOR)
+    mode = "contract"
 
-    return extract_structured_text(soup, content)
+    if container is None:
+        # Contract broken. Recover so the content team isn't blocked, but the
+        # caller reports this page as a build defect regardless of the outcome.
+        for sel in FALLBACK_SELECTORS:
+            candidate = soup.select_one(sel)
+            if candidate is None:
+                continue
+            for junk in candidate.select(CHROME_SELECTOR):
+                junk.decompose()
+            if len(candidate.get_text(" ", strip=True)) >= MIN_FALLBACK_CHARS:
+                container, mode = candidate, f"fallback:{sel}"
+                break
 
-@st.cache_data(show_spinner=False, ttl=3600)
-def fetch_web_text_cached(url: str) -> str:
-    return fetch_web_text_uncached(url)
+    if container is None:
+        body = soup.body
+        if body is not None:
+            for junk in body.select(CHROME_SELECTOR):
+                junk.decompose()
+            if len(body.get_text(" ", strip=True)) >= MIN_FALLBACK_CHARS:
+                container, mode = body, "fallback:body"
 
-def get_web_text(url: str, use_cache: bool) -> str:
-    return fetch_web_text_cached(url) if use_cache else fetch_web_text_uncached(url)
+    if container is None:
+        raise ContainerMissing(url)
 
-# ======================================================
-# QC NORMALIZATION + TOKENIZATION
-# ======================================================
-TOKEN_RE = re.compile(r"\w+|[^\w\s]", re.UNICODE)
+    if mode == "contract":
+        # Defensive: strip template chrome if it ever lands inside the container.
+        for junk in container.select('nav, footer, [role="dialog"], [aria-hidden="true"]'):
+            junk.decompose()
 
-def qc_normalize(text: str, normalize_smart_punct: bool = True) -> str:
-    """
-    Layout-insensitive, punctuation-aware normalization.
-    Collapses whitespace but keeps punctuation tokens.
-    """
-    t = text or ""
-    t = unicodedata.normalize("NFKC", t)
-    t = t.replace("\u200b", "").replace("\ufeff", "")  # zero-width/BOM
-    t = t.replace("\xa0", " ")  # NBSP
-
-    if normalize_smart_punct:
-        t = (
-            t.replace("“", '"').replace("”", '"')
-             .replace("‘", "'").replace("’", "'")
-             .replace("—", "-").replace("–", "-")
-             .replace("…", "...")
-        )
-
-    t = re.sub(r"\s+", " ", t).strip()
-    return t
-
-def tokenize(text: str) -> list[str]:
-    return TOKEN_RE.findall(text or "")
-
-# ======================================================
-# NOISE REMOVAL (PREVENT UI/FORMAT FALSE POSITIVES)
-# ======================================================
-NOISE_PATTERNS = [
-    r"^https?$",
-    r"^www$",
-    r"^https?://",
-    r"\.(jpg|jpeg|png|gif|webp|svg|mp4|mov|avi|m4v|pdf)$",
-    r"^wpdrpurl$",
-    r"^wp$",
-    r"^wordpress$",
-]
-
-NOISE_PHRASES = [
-    "schedule an appointment",
-    "book an appointment",
-    "hear from",
-]
-
-STOP_TOKENS = {
-    ".", ",", ":", ";", "!", "?", "(", ")", "[", "]", "{", "}", '"', "'",
-}
-
-def strip_phrases_case_insensitive(text: str, phrases: list[str]) -> str:
-    t = text or ""
-    for p in phrases:
-        if not p:
+    raw: list[tuple[str, str, int]] = []
+    emitted: set[int] = set()
+    for el in container.find_all(BLOCK_TAGS):
+        if any(id(p) in emitted for p in el.parents):
             continue
-        t = re.sub(re.escape(p), " ", t, flags=re.IGNORECASE)
-    t = re.sub(r"\s+", " ", t).strip()
-    return t
-
-def filter_tokens(tokens: list[str], ignore_pipes: bool = True) -> list[str]:
-    if not tokens:
-        return []
-    out = []
-    for t in tokens:
-        tl = t.lower()
-
-        # Ignore the literal pipe token introduced for table readability
-        if ignore_pipes and t == "|":
+        emitted.add(id(el))
+        text = el.get_text(" ", strip=True)
+        if not text:
             continue
+        name = el.name
+        if name in HEADING_TAGS:
+            raw.append((text, "heading", int(name[1])))
+        elif name == "li":
+            raw.append((text, "list_item", 0))
+        elif name == "blockquote":
+            raw.append((text, "quote", 0))
+        else:
+            raw.append((text, "paragraph", 0))
+    return raw, mode
 
-        if any(re.search(p, tl) for p in NOISE_PATTERNS):
-            continue
 
-        out.append(t)
-    return out
+# ======================================================================
+# ALIGNMENT → FINDINGS
+# ======================================================================
 
-# ======================================================
-# SCORING
-# ======================================================
-def token_sequence_similarity(doc_tokens: list[str], web_tokens: list[str]) -> float:
-    if not doc_tokens and not web_tokens:
-        return 100.0
-    if not doc_tokens or not web_tokens:
-        return 0.0
-    sm = difflib.SequenceMatcher(a=doc_tokens, b=web_tokens, autojunk=False)
-    return round(sm.ratio() * 100, 2)
+@dataclass
+class Finding:
+    kind: str          # MISSING | ALTERED | EXTRA | MOVED
+    section: str
+    doc_text: str = ""
+    web_text: str = ""
+    detail: str = ""
 
-def doc_coverage_score(doc_tokens: list[str], web_tokens: list[str]) -> float:
-    """
-    Primary QC score: percent of DOC tokens found on WEB (counts matter).
-    Ignores pure punctuation tokens to reduce formatting noise.
-    """
-    if not doc_tokens and not web_tokens:
-        return 100.0
-    if not doc_tokens:
-        return 100.0
-    if not web_tokens:
-        return 0.0
 
-    d = [t.lower() for t in doc_tokens if t not in STOP_TOKENS]
-    w = [t.lower() for t in web_tokens if t not in STOP_TOKENS]
-
-    if not d and not w:
-        return 100.0
-    if not d:
-        return 100.0
-    if not w:
-        return 0.0
-
-    dc = Counter(d)
-    wc = Counter(w)
-
-    matched = 0
-    total = sum(dc.values())
-    for tok, cnt in dc.items():
-        matched += min(cnt, wc.get(tok, 0))
-
-    return round((matched / max(total, 1)) * 100, 2)
-
-def token_diff_stats(doc_tokens: list[str], web_tokens: list[str]) -> dict:
-    sm = difflib.SequenceMatcher(a=doc_tokens, b=web_tokens, autojunk=False)
-    rep = ins = dele = eq = 0
+def word_level_change(doc_text: str, web_text: str, max_parts: int = 4) -> str:
+    a, b = doc_text.split(), web_text.split()
+    sm = difflib.SequenceMatcher(a=a, b=b, autojunk=False)
+    parts = []
     for tag, i1, i2, j1, j2 in sm.get_opcodes():
         if tag == "equal":
-            eq += (i2 - i1)
-        elif tag == "replace":
-            rep += max(i2 - i1, j2 - j1)
-        elif tag == "insert":
-            ins += (j2 - j1)
+            continue
+        was = " ".join(a[i1:i2])
+        now = " ".join(b[j1:j2])
+        if tag == "replace":
+            parts.append(f'"{was}" → "{now}"')
         elif tag == "delete":
-            dele += (i2 - i1)
-    return {"equal": eq, "replace": rep, "insert": ins, "delete": dele}
+            parts.append(f'removed "{was}"')
+        elif tag == "insert":
+            parts.append(f'added "{now}"')
+    if not parts:
+        return "whitespace or punctuation only"
+    if len(parts) > max_parts:
+        return "; ".join(parts[:max_parts]) + f" (+{len(parts) - max_parts} more)"
+    return "; ".join(parts)
 
-# ======================================================
-# DIFF RENDERING (FOR HUMAN REVIEW)
-# ======================================================
-def tokens_to_lines(tokens: list[str], per_line: int = 14) -> list[str]:
-    return [" ".join(tokens[i:i + per_line]) for i in range(0, len(tokens), per_line)]
 
-def create_token_diff_html(doc_tokens: list[str], web_tokens: list[str]) -> str:
-    d = difflib.HtmlDiff(wrapcolumn=120)
-    return d.make_file(
-        tokens_to_lines(doc_tokens),
-        tokens_to_lines(web_tokens),
-        "Doc (Tokens)",
-        "Web (Tokens)",
-        context=True,
-        numlines=2,
-    )
+def align(doc_blocks: list[Block], web_blocks: list[Block],
+          similarity_floor: float) -> list[Finding]:
+    a = [b.norm for b in doc_blocks]
+    b = [x.norm for x in web_blocks]
+    sm = difflib.SequenceMatcher(a=a, b=b, autojunk=False)
 
-# ======================================================
+    findings: list[Finding] = []
+
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == "equal":
+            continue
+
+        if tag == "delete":
+            for di in range(i1, i2):
+                findings.append(Finding("MISSING", doc_blocks[di].section,
+                                        doc_text=doc_blocks[di].text))
+            continue
+
+        if tag == "insert":
+            for wj in range(j1, j2):
+                findings.append(Finding("EXTRA", web_blocks[wj].section,
+                                        web_text=web_blocks[wj].text))
+            continue
+
+        # replace — pair doc blocks to their closest web counterpart
+        used: set[int] = set()
+        for di in range(i1, i2):
+            best_j, best_r = None, 0.0
+            for wj in range(j1, j2):
+                if wj in used:
+                    continue
+                r = difflib.SequenceMatcher(a=a[di], b=b[wj], autojunk=False).ratio()
+                if r > best_r:
+                    best_r, best_j = r, wj
+            if best_j is not None and best_r >= similarity_floor:
+                used.add(best_j)
+                findings.append(Finding(
+                    "ALTERED",
+                    doc_blocks[di].section,
+                    doc_text=doc_blocks[di].text,
+                    web_text=web_blocks[best_j].text,
+                    detail=word_level_change(doc_blocks[di].norm, web_blocks[best_j].norm),
+                ))
+            else:
+                findings.append(Finding("MISSING", doc_blocks[di].section,
+                                        doc_text=doc_blocks[di].text))
+        for wj in range(j1, j2):
+            if wj not in used:
+                findings.append(Finding("EXTRA", web_blocks[wj].section,
+                                        web_text=web_blocks[wj].text))
+
+    return reclassify_moved(findings)
+
+
+def reclassify_moved(findings: list[Finding]) -> list[Finding]:
+    """A MISSING block whose text also appears as EXTRA was relocated, not lost."""
+    missing = {i: qc_normalize(f.doc_text) for i, f in enumerate(findings) if f.kind == "MISSING"}
+    extra = {i: qc_normalize(f.web_text) for i, f in enumerate(findings) if f.kind == "EXTRA"}
+
+    drop: set[int] = set()
+    for mi, mtext in missing.items():
+        for ei, etext in extra.items():
+            if ei in drop:
+                continue
+            if mtext == etext:
+                doc_sec = findings[mi].section
+                web_sec = findings[ei].section
+                if doc_sec == web_sec:
+                    detail = "same text, different position on the page"
+                else:
+                    detail = (f"in the doc under '{doc_sec or '—'}', "
+                              f"on the page under '{web_sec or '—'}'")
+                findings[mi] = Finding(
+                    "MOVED", doc_sec,
+                    doc_text=findings[mi].doc_text,
+                    web_text=findings[ei].web_text,
+                    detail=detail,
+                )
+                drop.add(ei)
+                break
+    return [f for i, f in enumerate(findings) if i not in drop]
+
+
+# ======================================================================
+# PER-ROW PIPELINE
+# ======================================================================
+
+@dataclass
+class PageResult:
+    page: str
+    url: str
+    doc_url: str
+    status: str                       # CLEAN | REVIEW | DEV DEFECT | ERROR
+    message: str = ""
+    findings: list[Finding] = field(default_factory=list)
+    doc_block_count: int = 0
+    web_block_count: int = 0
+    extraction: str = "contract"
+
+    @property
+    def container_missing(self) -> bool:
+        return self.extraction != "contract"
+
+    @property
+    def counts(self) -> Counter:
+        return Counter(f.kind for f in self.findings)
+
+
+def qc_one(row: dict, cols: dict, settings: dict) -> PageResult:
+    url = str(row.get(cols["url"], "") or "").strip()
+    doc_url = str(row.get(cols["doc"], "") or "").strip()
+    page = str(row.get(cols["page"], "") or "").strip() if cols["page"] else ""
+    label = page or url or "(unnamed row)"
+
+    try:
+        if not url:
+            raise PageUnreadable("No URL in this row.")
+        if not doc_url:
+            raise DocUnreadable("No Google Doc link in this row.")
+
+        doc_raw = fetch_doc_raw(doc_url)
+        web_raw, extraction = fetch_page_raw(url)
+
+        doc_blocks = finalize_blocks(doc_raw, settings["smart_punct"], settings["strip_ctas"])
+        web_blocks = finalize_blocks(web_raw, settings["smart_punct"], settings["strip_ctas"])
+
+        findings = align(doc_blocks, web_blocks, settings["similarity_floor"])
+
+        if settings["ignore_extra"]:
+            findings = [f for f in findings if f.kind != "EXTRA"]
+
+        return PageResult(
+            page=label, url=url, doc_url=doc_url,
+            status="CLEAN" if not findings else "REVIEW",
+            findings=findings,
+            doc_block_count=len(doc_blocks),
+            web_block_count=len(web_blocks),
+            extraction=extraction,
+        )
+
+    except ContainerMissing as e:
+        return PageResult(label, url, doc_url, "DEV DEFECT", str(e))
+    except QCError as e:
+        return PageResult(label, url, doc_url, "ERROR", str(e))
+    except Exception as e:  # noqa: BLE001 — never let one row kill the run
+        return PageResult(label, url, doc_url, "ERROR",
+                          f"Unexpected problem reading this row. Send to Jen. ({type(e).__name__})")
+
+
+# ======================================================================
 # UI
-# ======================================================
-st.title("Content QC Agent")
+# ======================================================================
+
+st.title("Content QC")
+st.caption(
+    "Compares the words in the approved Google Doc against the words on the live page. "
+    "Formatting, SEO tags and links are not checked — those are the SEO QC pass."
+)
+
+if "results" not in st.session_state:
+    st.session_state.results = None
 
 with st.sidebar:
-    uploaded_key = None
-    if "gcp_service_account" not in st.secrets:
-        uploaded_key = st.file_uploader("Service Account JSON", type="json")
+    st.markdown("### Settings")
+    similarity_floor = st.slider(
+        "Altered-vs-missing threshold", 0.50, 0.95, 0.75, 0.05,
+        help="How similar two paragraphs must be to count as edited rather than "
+             "missing-and-replaced. Lower it if edits are showing up as MISSING + EXTRA pairs.",
+    )
+    smart_punct = st.toggle("Ignore smart quotes and dashes", value=True)
+    strip_ctas = st.toggle("Ignore template CTA phrases", value=True)
+    ignore_extra = st.toggle("Hide EXTRA findings", value=False,
+                             help="Turn on if template blocks inside the container "
+                                  "are creating noise.")
+    st.divider()
+    st.caption(f"Content is read from `{CONTENT_SELECTOR}`.")
 
-    st.markdown("### QC Settings")
-    sensitivity = st.slider("Coverage Threshold (%)", 70, 100, 98)
-    normalize_smart_punct = st.toggle("Ignore Smart Quotes/Dashes", value=True)
-    ignore_pipes = st.toggle("Ignore Table Pipes (|)", value=True)
-    strip_noise_phrases = st.toggle("Strip Common CTA Phrases", value=True)
-    use_cache = st.toggle("Cache Fetches (Faster Re-Runs)", value=True)
-
-    st.caption("Coverage is the pass/fail (formatting/order-robust). Sequence % is diagnostic only.")
-
-creds = get_creds(uploaded_key)
-if not creds:
-    st.error("Google credentials required")
+if get_credentials() is None:
+    st.error("This tool isn't configured yet. Contact Jen — the Google credentials are missing.")
     st.stop()
 
-creds_cache_key = creds_json_for_cache(uploaded_key) if use_cache else None
+st.markdown("**Upload a CSV** with a column for the page URL and a column for the Google Doc link.")
+csv_file = st.file_uploader("QC CSV", type="csv", label_visibility="collapsed")
 
-csv_file = st.file_uploader("Upload QC CSV", type="csv")
-run_clicked = st.button("Run QC")
-
-if run_clicked:
-    raw = csv_file.getvalue().decode("utf-8-sig") if csv_file else ""
-    rows = list(csv.DictReader(io.StringIO(raw))) if raw else []
+if st.button("Run QC", type="primary", disabled=csv_file is None):
+    raw = csv_file.getvalue().decode("utf-8-sig")
+    rows = list(csv.DictReader(io.StringIO(raw)))
 
     if not rows:
-        st.warning("Upload a CSV first (or CSV appears empty).")
-        st.session_state.qc_df = None
-        st.session_state.qc_problem_rows = None
-    else:
-        url_col = first_existing_col(rows, "URL", "Url", "url")
-        doc_col = first_existing_col(rows, "google_doc_url", "Google Doc URL", "Doc URL", "doc_url")
-        page_col = first_existing_col(rows, "Page Title", "Page", "Title", "page_title")
+        st.warning("That CSV is empty.")
+        st.stop()
 
-        if not url_col or not doc_col:
-            st.error("CSV must include columns for URL and google_doc_url (header names can vary).")
-            st.session_state.qc_df = None
-            st.session_state.qc_problem_rows = None
-        else:
-            results = []
-            total = len(rows)
-            progress = st.progress(0)
+    headers = set(rows[0].keys())
 
-            for i, r in enumerate(rows, start=1):
-                url = safe_str(r.get(url_col)).strip()
-                doc_url = safe_str(r.get(doc_col)).strip()
-                page_title = safe_str(r.get(page_col)).strip() if page_col else ""
-                display_page = page_title or url or f"Row {i}"
+    def pick(*names):
+        for n in names:
+            if n in headers:
+                return n
+        return None
 
-                try:
-                    if not url:
-                        raise ValueError("Missing URL")
-                    if not doc_url:
-                        raise ValueError("Missing google_doc_url")
+    cols = {
+        "url": pick("URL", "Url", "url", "Page URL", "page_url"),
+        "doc": pick("google_doc_url", "Google Doc URL", "Doc URL", "doc_url", "Doc"),
+        "page": pick("Page Title", "Page", "Title", "page_title"),
+    }
 
-                    # Fetch texts
-                    if use_cache and creds_cache_key:
-                        doc_text = get_doc_text_cached(doc_url, creds_cache_key)
-                    else:
-                        doc_text = get_doc_text(creds, doc_url)
+    if not cols["url"] or not cols["doc"]:
+        st.error(
+            "The CSV needs a column for the page URL and a column for the Google Doc link. "
+            f"Found these columns: {', '.join(sorted(headers))}"
+        )
+        st.stop()
 
-                    web_text = get_web_text(url, use_cache=use_cache)
+    settings = {
+        "similarity_floor": similarity_floor,
+        "smart_punct": smart_punct,
+        "strip_ctas": strip_ctas,
+        "ignore_extra": ignore_extra,
+    }
 
-                    # Normalize
-                    doc_qc = qc_normalize(doc_text, normalize_smart_punct=normalize_smart_punct)
-                    web_qc = qc_normalize(web_text, normalize_smart_punct=normalize_smart_punct)
+    progress = st.progress(0.0, text="Reading pages and docs…")
+    results: list[PageResult] = []
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        futures = [pool.submit(qc_one, r, cols, settings) for r in rows]
+        for i, fut in enumerate(futures, start=1):
+            results.append(fut.result())
+            progress.progress(i / len(futures), text=f"Checked {i} of {len(futures)} pages")
+    progress.empty()
+    st.session_state.results = results
 
-                    # Optional: strip common CTA phrases (case-insensitive, without destroying case)
-                    if strip_noise_phrases:
-                        doc_qc = strip_phrases_case_insensitive(doc_qc, NOISE_PHRASES)
-                        web_qc = strip_phrases_case_insensitive(web_qc, NOISE_PHRASES)
 
-                    # Tokenize + filter
-                    doc_tokens = filter_tokens(tokenize(doc_qc), ignore_pipes=ignore_pipes)
-                    web_tokens = filter_tokens(tokenize(web_qc), ignore_pipes=ignore_pipes)
-
-                    # Scores
-                    coverage_pct = doc_coverage_score(doc_tokens, web_tokens)
-                    seq_pct = token_sequence_similarity(doc_tokens, web_tokens)
-
-                    stats = token_diff_stats(doc_tokens, web_tokens)
-
-                    warning = ""
-                    if len(doc_tokens) > 0 and len(web_tokens) < 0.5 * len(doc_tokens):
-                        warning = (
-                            f"Web text much shorter than doc (web={len(web_tokens)} tokens, doc={len(doc_tokens)}). "
-                            "Possible missing DOM content (JS-injected accordion) or extraction issue."
-                        )
-                    elif coverage_pct >= sensitivity and seq_pct < sensitivity:
-                        warning = (
-                            "High coverage but low sequence alignment. Likely formatting/reordering/UI block differences "
-                            "(content probably copied correctly)."
-                        )
-
-                    status = "MATCH" if coverage_pct >= sensitivity else "MISMATCH"
-
-                    # Only generate diff when Coverage fails (diff can be misleading otherwise)
-                    diff_html = create_token_diff_html(doc_tokens, web_tokens) if status != "MATCH" else ""
-
-                    results.append(
-                        {
-                            "Page": display_page,
-                            "URL": url,
-                            "Doc URL": doc_url,
-                            "Status": status,
-                            "Coverage %": coverage_pct,
-                            "Sequence %": seq_pct,
-                            "Replaced": stats["replace"],
-                            "Inserted": stats["insert"],
-                            "Deleted": stats["delete"],
-                            "Warning": warning,
-                            "Error": "",
-                            "Diff": diff_html,
-                        }
-                    )
-
-                except Exception as e:
-                    results.append(
-                        {
-                            "Page": display_page,
-                            "URL": url,
-                            "Doc URL": doc_url,
-                            "Status": "ERROR",
-                            "Coverage %": 0.0,
-                            "Sequence %": 0.0,
-                            "Replaced": 0,
-                            "Inserted": 0,
-                            "Deleted": 0,
-                            "Warning": "",
-                            "Error": repr(e),
-                            "Diff": "",
-                        }
-                    )
-
-                progress.progress(i / total)
-
-            df = pd.DataFrame(results)
-            st.session_state.qc_df = df
-            st.session_state.qc_problem_rows = df[df["Status"] != "MATCH"].reset_index(drop=True)
-
-# ======================================================
+# ----------------------------------------------------------------------
 # DISPLAY
-# ======================================================
-if st.session_state.qc_df is not None:
-    df = st.session_state.qc_df
-    st.dataframe(df.drop(columns=["Diff"]), width="stretch")
+# ----------------------------------------------------------------------
 
-    problem_rows = st.session_state.qc_problem_rows
+results: Optional[list[PageResult]] = st.session_state.results
 
-    if problem_rows is not None and not problem_rows.empty:
-        st.download_button(
-            "Download Review CSV",
-            problem_rows.drop(columns=["Diff"]).to_csv(index=False).encode("utf-8"),
-            "qc_review.csv",
-        )
+if not results:
+    st.info("Upload a CSV and click Run QC.")
+    st.stop()
 
-        labels = problem_rows["Page"].fillna("").astype(str).str.strip()
-        labels = labels.where(labels != "", other=problem_rows["URL"].fillna("").astype(str).str.strip())
-        labels = labels.where(labels != "", other=("Row " + (problem_rows.index + 1).astype(str)))
+clean = [r for r in results if r.status == "CLEAN"]
+review = [r for r in results if r.status == "REVIEW"]
+dev = [r for r in results if r.status == "DEV DEFECT"]
+errors = [r for r in results if r.status == "ERROR"]
+fallback = [r for r in results if r.status in ("CLEAN", "REVIEW") and r.container_missing]
 
-        sel_i = st.selectbox(
-            "Inspect page",
-            options=list(problem_rows.index),
-            key="inspect_selectbox",
-            format_func=lambda idx: (
-                f"{labels.iloc[idx]} — {problem_rows.loc[idx, 'Status']} — "
-                f"Coverage {problem_rows.loc[idx, 'Coverage %']}% / Seq {problem_rows.loc[idx, 'Sequence %']}%"
-            ),
-        )
+c1, c2, c3, c4 = st.columns(4)
+c1.metric("Clean", len(clean))
+c2.metric("Need review", len(review))
+c3.metric("Build defects", len(dev) + len(fallback))
+c4.metric("Couldn't read", len(errors))
 
-        # ✅ FIX: no stray "_" assignment; always pull from the row safely
-        warn_msg = safe_str(problem_rows.loc[sel_i, "Warning"]).strip()
-        err_msg = safe_str(problem_rows.loc[sel_i, "Error"]).strip()
-        diff_html = safe_str(problem_rows.loc[sel_i, "Diff"])
+if fallback:
+    st.warning(
+        f"**{len(fallback)} page(s) are missing the `{CONTENT_SELECTOR}` container.** "
+        "They were checked anyway using a fallback content block, so the results below "
+        "are usable — MISSING and ALTERED findings are reliable. EXTRA findings on these "
+        "pages may just be template text (menus, footers) and should be treated with "
+        "suspicion.\n\n"
+        "This is a build issue, not a content issue. Send this list to the dev team."
+    )
+    st.code("\n".join(f"{r.url}   [{r.extraction}]" for r in fallback), language=None)
 
-        if warn_msg:
-            st.warning(warn_msg)
-        if err_msg:
-            st.error(err_msg)
+if dev:
+    st.error(
+        f"**{len(dev)} page(s) could not be read at all.** No `{CONTENT_SELECTOR}` container "
+        "and no usable content block. These pages were not checked — send to the dev team."
+    )
+    st.code("\n".join(r.url for r in dev), language=None)
 
-        if diff_html.strip():
-            components.html(diff_html, height=650, scrolling=True)
+if errors:
+    with st.expander(f"{len(errors)} row(s) couldn't be read"):
+        for r in errors:
+            st.markdown(f"- **{r.page}** — {r.message}")
+
+# Summary table
+summary = pd.DataFrame([
+    {
+        "Page": r.page,
+        "Status": r.status,
+        "Extraction": "Contract" if r.extraction == "contract" else "FALLBACK",
+        "Missing": r.counts.get("MISSING", 0),
+        "Altered": r.counts.get("ALTERED", 0),
+        "Extra": r.counts.get("EXTRA", 0),
+        "Moved": r.counts.get("MOVED", 0),
+        "URL": r.url,
+    }
+    for r in results
+])
+st.dataframe(summary, width="stretch", hide_index=True)
+
+# Full findings export
+export_rows = [
+    {
+        "Page": r.page,
+        "URL": r.url,
+        "Section": f.section,
+        "Issue": f.kind,
+        "What changed": f.detail,
+        "Doc text": f.doc_text,
+        "Page text": f.web_text,
+    }
+    for r in results for f in r.findings
+]
+if export_rows:
+    st.download_button(
+        "Download punch list (CSV)",
+        pd.DataFrame(export_rows).to_csv(index=False).encode("utf-8"),
+        "content_qc_punch_list.csv",
+        mime="text/csv",
+    )
+
+if not review:
+    if not dev and not errors:
+        st.success("Every page matches its doc.")
+    st.stop()
+
+st.divider()
+st.subheader("Punch list")
+
+labels = {i: f"{r.page} — {len(r.findings)} item(s)" for i, r in enumerate(results) if r.status == "REVIEW"}
+sel = st.selectbox("Page", options=list(labels), format_func=lambda i: labels[i])
+chosen = results[sel]
+
+st.caption(f"{chosen.url}  ·  doc has {chosen.doc_block_count} blocks, page has {chosen.web_block_count}")
+
+ICONS = {"MISSING": "🔴", "ALTERED": "🟠", "EXTRA": "🔵", "MOVED": "🟣"}
+ORDER = {"MISSING": 0, "ALTERED": 1, "MOVED": 2, "EXTRA": 3}
+
+for f in sorted(chosen.findings, key=lambda x: (ORDER[x.kind], x.section)):
+    section = f.section or "—"
+    with st.container(border=True):
+        st.markdown(f"{ICONS[f.kind]} **{f.kind}** · under *{section}*")
+        if f.kind == "MISSING":
+            st.markdown("In the doc, not on the page:")
+            st.markdown(f"> {f.doc_text}")
+        elif f.kind == "EXTRA":
+            st.markdown("On the page, not in the doc:")
+            st.markdown(f"> {f.web_text}")
+        elif f.kind == "MOVED":
+            st.markdown(f"Same text, different place — {f.detail}")
+            st.markdown(f"> {f.doc_text}")
         else:
-            st.info(
-                "No diff shown for this row. "
-                "Diffs are only generated when Coverage fails (to avoid misleading formatting-order diffs)."
-            )
-    else:
-        st.success("All rows are MATCH ✅")
-else:
-    st.caption("Upload a CSV and click Run QC to generate results.")
+            st.markdown(f"**{f.detail}**")
+            st.markdown(f"Doc: > {f.doc_text}")
+            st.markdown(f"Page: > {f.web_text}")
