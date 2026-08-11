@@ -76,6 +76,34 @@ CHROME_SELECTOR = (
 # false "unreadable" is worse than letting a near-empty page through as CLEAN.
 MIN_FALLBACK_CHARS = 120
 
+# --- Network pacing -------------------------------------------------------
+# Not exposed in the UI on purpose: these are infrastructure settings, not QC
+# settings, and the content team has no basis for choosing a value.
+#
+# Cloudways/Imunify360 Enhanced DOS Protection on the staging server allows 250
+# requests per 30-second window. At 1.5s spacing with 2 workers this run peaks
+# around 20 requests per 30s — roughly an eighth of the limit. Deliberately
+# conservative: a 40-page run takes about a minute either way, and other rules
+# (or other tenants sharing the same egress IP) can trigger blocks that the DoS
+# threshold alone does not explain.
+#
+# Adjust here if a client's host is stricter. Raising REQUEST_PACE_SECONDS is
+# always the safe direction.
+REQUEST_PACE_SECONDS = 1.5
+MAX_WORKERS = 2
+
+# --- Reporting -----------------------------------------------------------
+# How similar a doc block and a page block must be before an edit is reported
+# as one ALTERED finding with a word-level diff, rather than as a separate
+# MISSING and EXTRA pair.
+#
+# Not exposed in the UI: this changes how a difference is DESCRIBED, never
+# whether it is DETECTED. Verified across 0.50-0.95 — identical differences
+# surface at every value. Above ~0.90 even a one-word edit splits into two
+# findings the reader has to pair by eye, which is strictly worse. There is no
+# setting that catches more, so there is nothing for the content team to tune.
+SIMILARITY_FLOOR = 0.75
+
 REQUEST_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
@@ -397,8 +425,8 @@ def fetch_page_raw(url: str) -> tuple[list[tuple[str, str, int]], str]:
         raise PageUnreadable(f"SSL/certificate problem reaching this page. ({e.__class__.__name__})", True) from e
     except requests.exceptions.ConnectTimeout as e:
         raise PageUnreadable(
-            "Connection timed out — the host did not accept a connection within 10s. "
-            "If every page says this, the host is blocking this tool.", True
+            "Connection timed out — the site didn't respond. If every page says this, "
+            "the site's security is blocking this tool. Send to Jen.", True
         ) from e
     except requests.exceptions.ReadTimeout as e:
         raise PageUnreadable("The host connected but sent no response within 30s.", True) from e
@@ -415,8 +443,8 @@ def fetch_page_raw(url: str) -> tuple[list[tuple[str, str, int]], str]:
             raise PageUnreadable("Connection refused by the host.", True) from e
         if "reset by peer" in detail or "RemoteDisconnected" in detail:
             raise PageUnreadable(
-                "The host dropped the connection. Likely bot protection or rate limiting — "
-                "raise the delay between requests.", True
+                "The host dropped the connection — the site's security is blocking this "
+                "tool. Send this URL to Jen.", True
             ) from e
         raise PageUnreadable(f"Could not connect. {detail[:180]}", True) from e
     except requests.RequestException as e:
@@ -702,23 +730,11 @@ if "results" not in st.session_state:
 
 with st.sidebar:
     st.markdown("### Settings")
-    similarity_floor = st.slider(
-        "Altered-vs-missing threshold", 0.50, 0.95, 0.75, 0.05,
-        help="How similar two paragraphs must be to count as edited rather than "
-             "missing-and-replaced. Lower it if edits are showing up as MISSING + EXTRA pairs.",
-    )
     smart_punct = st.toggle("Ignore smart quotes and dashes", value=True)
     strip_ctas = st.toggle("Ignore template CTA phrases", value=True)
     ignore_extra = st.toggle("Hide EXTRA findings", value=False,
                              help="Turn on if template blocks inside the container "
                                   "are creating noise.")
-    workers = st.slider("Concurrent requests", 1, 8, 2,
-                        help="Lower this if pages start failing with connection errors — "
-                             "some hosts rate-limit or block parallel requests.")
-    pace = st.slider("Seconds between requests", 0.0, 5.0, 1.5, 0.5,
-                     help="Spacing between page requests. Hosts with bot protection "
-                          "block bursts of traffic — pacing avoids tripping them. "
-                          "Raise this if pages start timing out.")
     st.divider()
     st.caption(f"Content is read from `{CONTENT_SELECTOR}`.")
 
@@ -728,29 +744,56 @@ if get_credentials() is None:
 
 st.markdown("**Upload a CSV** with a column for the page URL and a column for the Google Doc link.")
 
-with st.expander("Test one page first (recommended if the last run failed)"):
+if "test_result" not in st.session_state:
+    st.session_state.test_result = None
+
+
+def _run_single_test(raw_url: str) -> tuple[str, str]:
+    url = (raw_url or "").strip()
+    if not url:
+        return ("error", "Enter a URL first.")
+
+    had_scheme = url.lower().startswith(("http://", "https://"))
+    attempts = [url] if had_scheme else ["https://" + url, "http://" + url]
+
+    set_pace(0.0)
+    last_error = "Could not reach that URL."
+    for attempt in attempts:
+        try:
+            raw, mode = fetch_page_raw(attempt)
+            words = sum(len(t.split()) for t, _, _ in raw)
+            if mode == "contract":
+                return ("success",
+                        f"Reachable. Found `{CONTENT_SELECTOR}` with {len(raw)} blocks / {words} words.")
+            return ("warning",
+                    f"Reachable, but `{CONTENT_SELECTOR}` is missing. Recovered {len(raw)} blocks / "
+                    f"{words} words using `{mode.split(':', 1)[1]}`. This is a build issue — "
+                    "send the URL to the dev team.")
+        except ContainerMissing as e:
+            return ("error", str(e))
+        except QCError as e:
+            last_error = str(e)
+            continue
+        except Exception as e:  # noqa: BLE001
+            return ("error", f"Unexpected problem. Send to Jen. ({type(e).__name__})")
+    return ("error", last_error)
+
+
+with st.expander("Test one page first (recommended if the last run failed)",
+                 expanded=st.session_state.test_result is not None):
     st.caption(
         "Checks a single URL without running the whole list. Use this after a failed run — "
         "it tells you whether the site is reachable using one request instead of forty."
     )
     test_url = st.text_input("Page URL", key="test_url", placeholder="https://example.com/a-page/")
-    if st.button("Test this page") and test_url.strip():
-        set_pace(0.0)
-        try:
-            raw, mode = fetch_page_raw(test_url.strip())
-            words = sum(len(t.split()) for t, _, _ in raw)
-            if mode == "contract":
-                st.success(f"Reachable. Found `{CONTENT_SELECTOR}` with {len(raw)} blocks / {words} words.")
-            else:
-                st.warning(
-                    f"Reachable, but `{CONTENT_SELECTOR}` is missing. Recovered {len(raw)} blocks / "
-                    f"{words} words using `{mode.split(':', 1)[1]}`. This is a build issue — "
-                    "send the URL to the dev team."
-                )
-        except QCError as e:
-            st.error(str(e))
-        except Exception as e:  # noqa: BLE001
-            st.error(f"Unexpected problem. Send to Jen. ({type(e).__name__})")
+    if st.button("Test this page"):
+        st.session_state.test_result = _run_single_test(test_url)
+        st.rerun()
+
+    result = st.session_state.test_result
+    if result:
+        kind, message = result
+        {"success": st.success, "warning": st.warning, "error": st.error}[kind](message)
 
 csv_file = st.file_uploader("QC CSV", type="csv", label_visibility="collapsed")
 
@@ -784,22 +827,24 @@ if st.button("Run QC", type="primary", disabled=csv_file is None):
         st.stop()
 
     settings = {
-        "similarity_floor": similarity_floor,
+        "similarity_floor": SIMILARITY_FLOOR,
         "smart_punct": smart_punct,
         "strip_ctas": strip_ctas,
         "ignore_extra": ignore_extra,
     }
 
-    set_pace(pace)
+    set_pace(REQUEST_PACE_SECONDS)
     GUARD.reset(limit=5)
 
-    if pace > 0:
-        est = int((len(rows) * pace) / max(1, 1)) + 5
-        st.caption(f"Pacing at {pace:g}s between requests — roughly {est // 60}m {est % 60}s for {len(rows)} pages.")
+    est = int(len(rows) * REQUEST_PACE_SECONDS) + 5
+    st.caption(
+        f"Checking {len(rows)} pages at a deliberately slow pace so the site's bot "
+        f"protection isn't triggered. This takes about {est // 60}m {est % 60}s."
+    )
 
     progress = st.progress(0.0, text="Reading pages and docs…")
     results: list[PageResult] = []
-    with ThreadPoolExecutor(max_workers=workers) as pool:
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
         futures = [pool.submit(qc_one, r, cols, settings) for r in rows]
         for i, fut in enumerate(futures, start=1):
             results.append(fut.result())
