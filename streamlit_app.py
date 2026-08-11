@@ -29,6 +29,7 @@ import re
 import unicodedata
 from collections import Counter
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Optional
@@ -142,6 +143,76 @@ def get_session() -> requests.Session:
 # ERRORS — every message must tell the content team what to do next
 # ======================================================================
 
+# ======================================================================
+# PACING + CIRCUIT BREAKER
+# ======================================================================
+#
+# Hosts behind a WAF (Cloudways/Imunify360 among them) count requests per IP
+# in short windows and firewall the source when a burst crosses the limit.
+# A 40-page QC run is exactly that shape of traffic. Two guards:
+#   _pace()  spaces request starts globally, across all worker threads
+#   GUARD    stops the run after repeated connection failures, so a blocked
+#            tool does not keep knocking and deepen the block
+
+_pace_lock = threading.Lock()
+_pace_state = {"last": 0.0, "interval": 0.0}
+
+
+def set_pace(seconds: float) -> None:
+    _pace_state["interval"] = max(0.0, float(seconds))
+    _pace_state["last"] = 0.0
+
+
+def _pace() -> None:
+    """Block until at least `interval` has passed since the last request start.
+    The sleep happens under the lock on purpose — that serialises pacing across
+    every worker so concurrency never defeats the rate limit."""
+    interval = _pace_state["interval"]
+    if interval <= 0:
+        return
+    with _pace_lock:
+        now = time.monotonic()
+        wait = _pace_state["last"] + interval - now
+        if wait > 0:
+            time.sleep(wait)
+            now = time.monotonic()
+        _pace_state["last"] = now
+
+
+class RunGuard:
+    """Trips after N consecutive connection-level failures."""
+
+    def __init__(self, limit: int = 5):
+        self._lock = threading.Lock()
+        self.limit = limit
+        self.consecutive = 0
+        self.tripped = False
+
+    def reset(self, limit: int = 5) -> None:
+        with self._lock:
+            self.limit = limit
+            self.consecutive = 0
+            self.tripped = False
+
+    def record_failure(self) -> None:
+        with self._lock:
+            self.consecutive += 1
+            if self.consecutive >= self.limit:
+                self.tripped = True
+
+    def record_success(self) -> None:
+        with self._lock:
+            self.consecutive = 0
+
+    @property
+    def is_tripped(self) -> bool:
+        with self._lock:
+            return self.tripped
+
+
+GUARD = RunGuard()
+
+
 class QCError(Exception):
     """Base for errors surfaced to the content team in plain language."""
 
@@ -161,6 +232,12 @@ class ContainerMissing(QCError):
 
 
 class PageUnreadable(QCError):
+    def __init__(self, message: str, connection_level: bool = False):
+        super().__init__(message)
+        self.connection_level = connection_level
+
+
+class RunAborted(QCError):
     pass
 
 
@@ -313,14 +390,18 @@ def fetch_doc_raw(doc_url: str) -> list[tuple[str, str, int]]:
 
 @st.cache_data(show_spinner=False, ttl=3600)
 def fetch_page_raw(url: str) -> tuple[list[tuple[str, str, int]], str]:
+    _pace()
     try:
-        resp = get_session().get(url, headers=REQUEST_HEADERS, timeout=30, allow_redirects=True)
+        resp = get_session().get(url, headers=REQUEST_HEADERS, timeout=(10, 30), allow_redirects=True)
     except requests.exceptions.SSLError as e:
-        raise PageUnreadable(f"SSL/certificate problem reaching this page. ({e.__class__.__name__})") from e
+        raise PageUnreadable(f"SSL/certificate problem reaching this page. ({e.__class__.__name__})", True) from e
     except requests.exceptions.ConnectTimeout as e:
-        raise PageUnreadable("Connection timed out — the host accepted nothing within 30s.") from e
+        raise PageUnreadable(
+            "Connection timed out — the host did not accept a connection within 10s. "
+            "If every page says this, the host is blocking this tool.", True
+        ) from e
     except requests.exceptions.ReadTimeout as e:
-        raise PageUnreadable("The host connected but sent no response within 30s.") from e
+        raise PageUnreadable("The host connected but sent no response within 30s.", True) from e
     except requests.exceptions.TooManyRedirects as e:
         raise PageUnreadable("This URL redirects in a loop.") from e
     except requests.exceptions.ConnectionError as e:
@@ -328,18 +409,18 @@ def fetch_page_raw(url: str) -> tuple[list[tuple[str, str, int]], str]:
         if "Name or service not known" in detail or "nodename nor servname" in detail:
             raise PageUnreadable(
                 "DNS lookup failed — this hostname does not resolve. "
-                "The staging site may have moved or been torn down."
+                "The staging site may have moved or been torn down.", True
             ) from e
         if "Connection refused" in detail:
-            raise PageUnreadable("Connection refused by the host.") from e
+            raise PageUnreadable("Connection refused by the host.", True) from e
         if "reset by peer" in detail or "RemoteDisconnected" in detail:
             raise PageUnreadable(
                 "The host dropped the connection. Likely bot protection or rate limiting — "
-                "lower the concurrent requests setting."
+                "raise the delay between requests.", True
             ) from e
-        raise PageUnreadable(f"Could not connect. {detail[:180]}") from e
+        raise PageUnreadable(f"Could not connect. {detail[:180]}", True) from e
     except requests.RequestException as e:
-        raise PageUnreadable(f"Request failed: {e.__class__.__name__}. {str(e)[:180]}") from e
+        raise PageUnreadable(f"Request failed: {e.__class__.__name__}. {str(e)[:180]}", True) from e
 
     if resp.status_code == 404:
         raise PageUnreadable("Page not found (404). Check the URL in your CSV.")
@@ -562,6 +643,12 @@ def qc_one(row: dict, cols: dict, settings: dict) -> PageResult:
     label = page or url or "(unnamed row)"
 
     try:
+        if GUARD.is_tripped:
+            raise RunAborted(
+                "Run stopped early. Several pages in a row refused the connection, "
+                "which usually means the host is blocking this tool. Remaining pages "
+                "were skipped so the block isn't made worse."
+            )
         if not url:
             raise PageUnreadable("No URL in this row.")
         if not doc_url:
@@ -569,6 +656,7 @@ def qc_one(row: dict, cols: dict, settings: dict) -> PageResult:
 
         doc_raw = fetch_doc_raw(doc_url)
         web_raw, extraction = fetch_page_raw(url)
+        GUARD.record_success()
 
         doc_blocks = finalize_blocks(doc_raw, settings["smart_punct"], settings["strip_ctas"])
         web_blocks = finalize_blocks(web_raw, settings["smart_punct"], settings["strip_ctas"])
@@ -588,8 +676,11 @@ def qc_one(row: dict, cols: dict, settings: dict) -> PageResult:
         )
 
     except ContainerMissing as e:
+        GUARD.record_success()  # we reached the page; the container is the problem
         return PageResult(label, url, doc_url, "DEV DEFECT", str(e))
     except QCError as e:
+        if isinstance(e, PageUnreadable) and e.connection_level:
+            GUARD.record_failure()
         return PageResult(label, url, doc_url, "ERROR", str(e))
     except Exception as e:  # noqa: BLE001 — never let one row kill the run
         return PageResult(label, url, doc_url, "ERROR",
@@ -621,9 +712,13 @@ with st.sidebar:
     ignore_extra = st.toggle("Hide EXTRA findings", value=False,
                              help="Turn on if template blocks inside the container "
                                   "are creating noise.")
-    workers = st.slider("Concurrent requests", 1, 8, 3,
+    workers = st.slider("Concurrent requests", 1, 8, 2,
                         help="Lower this if pages start failing with connection errors — "
                              "some hosts rate-limit or block parallel requests.")
+    pace = st.slider("Seconds between requests", 0.0, 5.0, 1.5, 0.5,
+                     help="Spacing between page requests. Hosts with bot protection "
+                          "block bursts of traffic — pacing avoids tripping them. "
+                          "Raise this if pages start timing out.")
     st.divider()
     st.caption(f"Content is read from `{CONTENT_SELECTOR}`.")
 
@@ -632,6 +727,31 @@ if get_credentials() is None:
     st.stop()
 
 st.markdown("**Upload a CSV** with a column for the page URL and a column for the Google Doc link.")
+
+with st.expander("Test one page first (recommended if the last run failed)"):
+    st.caption(
+        "Checks a single URL without running the whole list. Use this after a failed run — "
+        "it tells you whether the site is reachable using one request instead of forty."
+    )
+    test_url = st.text_input("Page URL", key="test_url", placeholder="https://example.com/a-page/")
+    if st.button("Test this page") and test_url.strip():
+        set_pace(0.0)
+        try:
+            raw, mode = fetch_page_raw(test_url.strip())
+            words = sum(len(t.split()) for t, _, _ in raw)
+            if mode == "contract":
+                st.success(f"Reachable. Found `{CONTENT_SELECTOR}` with {len(raw)} blocks / {words} words.")
+            else:
+                st.warning(
+                    f"Reachable, but `{CONTENT_SELECTOR}` is missing. Recovered {len(raw)} blocks / "
+                    f"{words} words using `{mode.split(':', 1)[1]}`. This is a build issue — "
+                    "send the URL to the dev team."
+                )
+        except QCError as e:
+            st.error(str(e))
+        except Exception as e:  # noqa: BLE001
+            st.error(f"Unexpected problem. Send to Jen. ({type(e).__name__})")
+
 csv_file = st.file_uploader("QC CSV", type="csv", label_visibility="collapsed")
 
 if st.button("Run QC", type="primary", disabled=csv_file is None):
@@ -669,6 +789,13 @@ if st.button("Run QC", type="primary", disabled=csv_file is None):
         "strip_ctas": strip_ctas,
         "ignore_extra": ignore_extra,
     }
+
+    set_pace(pace)
+    GUARD.reset(limit=5)
+
+    if pace > 0:
+        est = int((len(rows) * pace) / max(1, 1)) + 5
+        st.caption(f"Pacing at {pace:g}s between requests — roughly {est // 60}m {est % 60}s for {len(rows)} pages.")
 
     progress = st.progress(0.0, text="Reading pages and docs…")
     results: list[PageResult] = []
