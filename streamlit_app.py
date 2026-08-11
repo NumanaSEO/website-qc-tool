@@ -25,10 +25,10 @@ from __future__ import annotations
 import csv
 import difflib
 import io
-import json
 import re
 import unicodedata
 from collections import Counter
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Optional
@@ -70,8 +70,19 @@ CHROME_SELECTOR = (
 )
 
 # A fallback extraction yielding less than this is treated as a failed read
-# rather than a page whose content is genuinely missing.
-MIN_FALLBACK_CHARS = 400
+# rather than a page whose content is genuinely missing. Kept low on purpose:
+# thin pages (locations, thank-you, short service pages) are legitimate, and a
+# false "unreadable" is worse than letting a near-empty page through as CLEAN.
+MIN_FALLBACK_CHARS = 120
+
+REQUEST_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Numana-QC/2.0"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+}
 
 SCOPES = [
     "https://www.googleapis.com/auth/documents.readonly",
@@ -114,7 +125,17 @@ def _build_session() -> requests.Session:
     return s
 
 
-SESSION = _build_session()
+_local = threading.local()
+
+
+def get_session() -> requests.Session:
+    """One Session per worker thread. A shared Session across threads mutates
+    shared state and can surface as connection errors."""
+    sess = getattr(_local, "session", None)
+    if sess is None:
+        sess = _build_session()
+        _local.session = sess
+    return sess
 
 
 # ======================================================================
@@ -152,13 +173,20 @@ class DocUnreadable(QCError):
 # ======================================================================
 
 def get_credentials() -> Optional[service_account.Credentials]:
-    if "gcp_service_account" not in st.secrets:
+    try:
+        if "gcp_service_account" not in st.secrets:
+            return None
+        info = dict(st.secrets["gcp_service_account"])
+    except Exception:
+        # No secrets file at all, or a malformed one. Both mean "not configured".
         return None
-    info = dict(st.secrets["gcp_service_account"])
     pk = info.get("private_key")
     if isinstance(pk, str):
         info["private_key"] = pk.replace("\\n", "\n")
-    return service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
+    try:
+        return service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
+    except Exception:
+        return None
 
 
 def _docs_service():
@@ -286,11 +314,32 @@ def fetch_doc_raw(doc_url: str) -> list[tuple[str, str, int]]:
 @st.cache_data(show_spinner=False, ttl=3600)
 def fetch_page_raw(url: str) -> tuple[list[tuple[str, str, int]], str]:
     try:
-        resp = SESSION.get(url, headers={"User-Agent": "Numana-QC/2.0"}, timeout=30)
+        resp = get_session().get(url, headers=REQUEST_HEADERS, timeout=30, allow_redirects=True)
+    except requests.exceptions.SSLError as e:
+        raise PageUnreadable(f"SSL/certificate problem reaching this page. ({e.__class__.__name__})") from e
+    except requests.exceptions.ConnectTimeout as e:
+        raise PageUnreadable("Connection timed out — the host accepted nothing within 30s.") from e
+    except requests.exceptions.ReadTimeout as e:
+        raise PageUnreadable("The host connected but sent no response within 30s.") from e
+    except requests.exceptions.TooManyRedirects as e:
+        raise PageUnreadable("This URL redirects in a loop.") from e
+    except requests.exceptions.ConnectionError as e:
+        detail = str(e.__cause__ or e)
+        if "Name or service not known" in detail or "nodename nor servname" in detail:
+            raise PageUnreadable(
+                "DNS lookup failed — this hostname does not resolve. "
+                "The staging site may have moved or been torn down."
+            ) from e
+        if "Connection refused" in detail:
+            raise PageUnreadable("Connection refused by the host.") from e
+        if "reset by peer" in detail or "RemoteDisconnected" in detail:
+            raise PageUnreadable(
+                "The host dropped the connection. Likely bot protection or rate limiting — "
+                "lower the concurrent requests setting."
+            ) from e
+        raise PageUnreadable(f"Could not connect. {detail[:180]}") from e
     except requests.RequestException as e:
-        raise PageUnreadable(
-            "Couldn't reach this page. Check the URL, or the staging site may be down."
-        ) from e
+        raise PageUnreadable(f"Request failed: {e.__class__.__name__}. {str(e)[:180]}") from e
 
     if resp.status_code == 404:
         raise PageUnreadable("Page not found (404). Check the URL in your CSV.")
@@ -311,15 +360,20 @@ def fetch_page_raw(url: str) -> tuple[list[tuple[str, str, int]], str]:
     if container is None:
         # Contract broken. Recover so the content team isn't blocked, but the
         # caller reports this page as a build defect regardless of the outcome.
+        # Take the richest candidate, not the first — a thin <main> wrapper
+        # should not beat a fuller .entry-content.
+        best, best_len, best_sel = None, 0, ""
         for sel in FALLBACK_SELECTORS:
             candidate = soup.select_one(sel)
             if candidate is None:
                 continue
             for junk in candidate.select(CHROME_SELECTOR):
                 junk.decompose()
-            if len(candidate.get_text(" ", strip=True)) >= MIN_FALLBACK_CHARS:
-                container, mode = candidate, f"fallback:{sel}"
-                break
+            size = len(candidate.get_text(" ", strip=True))
+            if size > best_len:
+                best, best_len, best_sel = candidate, size, sel
+        if best is not None and best_len >= MIN_FALLBACK_CHARS:
+            container, mode = best, f"fallback:{best_sel}"
 
     if container is None:
         body = soup.body
@@ -567,6 +621,9 @@ with st.sidebar:
     ignore_extra = st.toggle("Hide EXTRA findings", value=False,
                              help="Turn on if template blocks inside the container "
                                   "are creating noise.")
+    workers = st.slider("Concurrent requests", 1, 8, 3,
+                        help="Lower this if pages start failing with connection errors — "
+                             "some hosts rate-limit or block parallel requests.")
     st.divider()
     st.caption(f"Content is read from `{CONTENT_SELECTOR}`.")
 
@@ -615,7 +672,7 @@ if st.button("Run QC", type="primary", disabled=csv_file is None):
 
     progress = st.progress(0.0, text="Reading pages and docs…")
     results: list[PageResult] = []
-    with ThreadPoolExecutor(max_workers=6) as pool:
+    with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = [pool.submit(qc_one, r, cols, settings) for r in rows]
         for i, fut in enumerate(futures, start=1):
             results.append(fut.result())
