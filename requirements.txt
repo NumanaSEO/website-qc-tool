@@ -1,7 +1,6 @@
 streamlit
 google-api-python-client
 google-auth
-google-cloud-aiplatform
 beautifulsoup4
 requests
 pandas
